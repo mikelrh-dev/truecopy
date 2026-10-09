@@ -5,7 +5,7 @@ Si algo falla en un paso, no avances al siguiente: cada paso dice qué éxito
 esperar.
 
 > Convención: comandos en PowerShell desde la raíz del repo
-> (`C:\Users\mikel\Documents\RAGProyect`). Ajusta la IP y la subred a tu red.
+> (`C:\TrueCopy`). Ajusta la IP y la subred a tu red.
 
 ## Paso 0 — Requisitos
 
@@ -108,7 +108,7 @@ En PowerShell como administrador (ajusta la subred a la tuya):
 ```powershell
 New-NetFirewallRule -DisplayName "Plant RAG Streamlit LAN" `
   -Direction Inbound -Protocol TCP -LocalPort 8501 `
-  -Action Allow -RemoteAddress 192.168.1.0/24
+  -Action Allow -RemoteAddress 192.0.2.0/24  # ejemplo: pon tu subred LAN
 ```
 
 Comprueba que no exista otra regla más amplia para el 8501. Sin esto, no hay
