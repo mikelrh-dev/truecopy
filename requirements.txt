@@ -1,0 +1,19 @@
+# Pinned runtime stack — ADR-002 (design.md, "Decision 2: Stack validated vs budget").
+# torch CPU wheels resolve from the PyTorch CPU index; PyPI stays the default index.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+pymupdf==1.24.14
+sentence-transformers==3.4.1
+torch==2.5.1+cpu
+# Transitive pin: transformers >=4.52 refuses torch.load() on torch <2.6
+# (CVE-2025-32434 guard), which bricks BAAI/bge-m3 (pytorch_model.bin only)
+# on the ADR-002-pinned torch 2.5.1+cpu. 4.49.0 stays inside sentence-
+# transformers 3.4.1's range and loads the model at 1024 dims; unpin only
+# together with a torch re-pin in ADR-002.
+transformers==4.49.0
+qdrant-client==1.12.2
+streamlit==1.41.1
+argon2-cffi==25.1.0
+
+# Test runner (lands with Phase 1 — config.yaml apply.tdd flips once the suite exists)
+pytest==9.1.1

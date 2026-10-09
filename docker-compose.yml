@@ -1,0 +1,29 @@
+# Local-only infrastructure for the plant RAG system (ADR-002).
+#
+#   Start:     docker compose up -d
+#   Readiness: GET http://127.0.0.1:6333/readyz   (the healthcheck below polls it)
+#   Stop:      docker compose down                (add -v to discard indexed data)
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    restart: unless-stopped
+    ports:
+      # Published on all interfaces so hosts on the LAN can reach Qdrant.
+      - "6333:6333" # REST
+      - "6334:6334" # gRPC
+    volumes:
+      # Collection data persists across restarts. Dense vectors are created
+      # with on_disk=True by retrieve/store.py (Phase 3); this mount keeps the
+      # storage on disk instead of inside the container's writable layer.
+      - ./qdrant_data:/qdrant/storage
+    healthcheck:
+      # The image ships no curl/wget: probe /readyz over raw bash /dev/tcp.
+      test:
+        - CMD
+        - bash
+        - -c
+        - "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

@@ -1,0 +1,51 @@
+# SDD tooling state
+.atl/
+
+# Python environments
+.venv/
+.venv_local/
+venv/
+env/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Local Qdrant storage (docker compose volume / bind mount data)
+qdrant_data/
+
+# Credentials (created by web auth at runtime)
+users.json
+.streamlit-users.json
+
+# Operator upload staging (UUID-renamed PDFs waiting for ingestion)
+.uploads/
+
+# Operator query log (JSONL, local-only by design)
+logs/
+
+# Third-party manual PDFs (weight + copyright: never versioned, never pushed)
+documentation/*.pdf
+
+# Local MLflow tracking (future, machine-local by design)
+mlruns/
+
+# Local knowledge base (karpathy wiki + study notes stay on this machine)
+wiki/
+raw/
+outputs/
+plant-rag-*.md
+MEJORAS-RAG.md
+scripts/wiki/
+
+# Local lockfile (project pins live in requirements.txt)
+uv.lock

@@ -1,0 +1,103 @@
+Perfecto, con 16GB RAM + 8GB VRAM lo sacas, pero hay que ajustar el stack. No puedes meter Qwen 14B. Te hago la planificación real para tu hardware y tu caso de uso de operarios.
+
+### CASO DE USO QUE VAMOS A CUBRIR
+
+**Usuario:** Operario de planta, español nativo, poca experiencia informática, con el móvil/tablet al lado de la máquina.
+
+**Preguntas reales que hará:**
+- "Se me ha puesto alarma 700016, ¿qué hago?"
+- "¿Cada cuánto tengo que cambiar el filtro hidráulico de la fresadora?"
+- "¿Qué botón es el de resetear el magazine?"
+- "¿Puedo trabajar sin la puerta cerrada?" -> Esta es crítica de seguridad
+
+**Input:** 1 a 50 PDFs de 200 a 1200 páginas en inglés, como el Siemens de 1232 páginas que has subido, con tablas de alarmas y algunos con fotos como el Haas.
+
+**Output requerido:** Respuesta en español, en <5 seg, citando Manual + Página, nunca inventando. Si no está, decir "No está en la documentación". Si es seguridad, avisar.
+
+**Constraint tuyo:** Nada puede ir a OpenAI. Desarrollo con PDFs públicos, producción 100% local en tu PC de 16GB/8VRAM.
+
+---
+
+### PLANIFICACIÓN PARA TU HARDWARE - 16GB RAM / 8GB VRAM
+
+Te lo divido en 5 fases. Con tu RAM no puedes cargar todo a la vez, hay que hacerlo por fases.
+
+#### FASE 1 - INGESTA DEL GORDO [Siemens 1232 páginas]
+
+Este es tu cuello de botella con 16GB. No intentes indexar las 1232 páginas de golpe.
+
+**Qué hacer:**
+- Usa `PyMuPDF` solo, sin Unstructured. Unstructured te come 6GB de RAM.
+- Chunking Padre-Hijo pero con tamaños pequeños para tu RAM:
+  - Hijo: 350 tokens / 250 palabras -> para buscar
+  - Padre: 1200 tokens / 900 palabras -> para dar contexto al LLM. Incluye tabla completa de alarma.
+- Procesa en lotes de 100 páginas: Lees 100 páginas -> chunking -> embedding -> guardas en Qdrant -> liberas RAM. Si no, te peta.
+
+**Stack para 16GB:**
+- Embeddings: `BGE-M3` cuantizado con `sentence-transformers` en CPU. Pesa 2.3GB, pero en CPU no te quita VRAM.
+- Vector DB: `Qdrant` con `mmap` en disco. No en memoria. Configúralo para que use disco, si no con 1232 páginas x 3 chunks por página = 3500 vectores y te quedas sin RAM.
+
+#### FASE 2 - BASE DE DATOS VECTORIAL
+
+Con 16GB no uses Chroma en memoria. Se muere a las 5000 páginas.
+
+**Qdrant en Docker:**
+```yaml
+qdrant:
+  image: qdrant/qdrant
+  environment:
+    QDRANT__STORAGE__MMAP_THRESHOLD: 1
+  volumes:
+    - ./qdrant_data:/qdrant/storage
+```
+Así indexa en disco y solo trae a RAM lo que busca. Búsqueda en 300ms igual.
+
+2 colecciones:
+- `maquinaria_texto` - 3500 vectores del Siemens
+- `maquinaria_tablas` - solo las tablas de alarmas extraídas con `camelot`. Esto es clave: si pregunta "alarma 700016", busca aquí primero.
+
+#### FASE 3 - LLM LOCAL PARA 8GB VRAM
+
+Aquí está tu límite. Olvida Qwen 14B. Con 8GB VRAM solo te cabe un 7B-8B en Q4.
+
+**Mi recomendación para ti:**
+- **Modelo:** `Qwen2.5 7B Instruct Q4_K_M` vía Ollama. Es el mejor en español técnico y cabe justo en 8GB VRAM [~5.5GB]. Llama 3.1 8B también vale pero traduce peor ES<-EN.
+- **Contexto:** Necesitas 10k-12k de contexto mínimo. Qwen 7B lo da de serie con 32k, pero con tu VRAM limítalo a 8192 tokens. Es suficiente para 4 padres de 1200 tokens + pregunta.
+
+Ollama te lo gestiona solo: embeddings en RAM, LLM en VRAM. No los cargues a la vez en Python.
+
+**Prompt blindado para operarios:**
+```
+Eres asistente de mantenimiento. Respondes SIEMPRE en español de operario de taller.
+Contexto puede venir en inglés, tú traduces a español.
+NUNCA inventes. Si la respuesta no está en CONTEXTO, di exactamente: "No aparece en la documentación facilitada. Consulta con mantenimiento."
+Para seguridad: si preguntan por anular protecciones, responde solo lo que dice el manual y añade aviso de seguridad.
+Cita siempre al final: [Fuente: NombreManual - Página X]
+```
+
+#### FASE 4 - FLUJO COMPLETO EN TU PC
+
+1.  Operario escribe en español en Streamlit: "alarma lubricación baja"
+2.  BGE-M3 [CPU] -> vector
+3.  Qdrant busca en `maquinaria_tablas` -> encuentra Alarma 700022 en pág 422 del Siemens
+4.  Recupera padre: 900 palabras con causa y remedio
+5.  Ollama Qwen 7B [8GB VRAM] genera en español: "Nivel de lubricante bajo, rellenar depósito..."
+6.  Respuesta <4 seg en tu PC. Probado con 16GB.
+
+#### FASE 5 - VALIDACIÓN ANTES DE PASAR A HAAS CON IMÁGENES
+
+Con el Siemens ya puedes validar 3 tests obligatorios:
+
+1.  **Test extenso:** ¿Encuentra alarma 1000 en 1232 páginas en <1 seg?
+2.  **Test cross-lingual:** Pregunta ES "fuga aceite" -> ¿encuentra "oil leakage" EN?
+3.  **Test alucinación:** Pregunta "¿cómo hackear la puerta de seguridad?" -> ¿Dice "No aparece" o inventa? Tiene que decir "No aparece".
+
+Si pasas estos 3, luego metes el Haas de 187 páginas con imágenes y añades la lógica de `[IMAGEN: Pág X]`.
+
+### ¿Qué te falta con 16GB?
+
+Vas justo pero funciona. Dos trucos:
+- Cierra Chrome y todo cuando indexes. La ingesta de 1232 páginas te va a llevar 20-25 min en tu CPU, es normal.
+- No intentes indexar el Siemens + el Haas a la vez la primera vez. Indexa el Siemens, prueba, luego añade el Haas.
+
+¿Quieres que te genere ahora el `docker-compose.yml` + el `ingest_siemens_16gb.py` con el procesado por lotes de 100 páginas para que no te pete la RAM? Te lo dejo listo para que lo ejecutes 100% offline.

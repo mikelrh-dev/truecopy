@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plant-rag"
+version = "0.1.0"
+description = "Local-only RAG assistant: Spanish queries over English plant machine manuals."
+requires-python = ">=3.11"
+# Pinned runtime dependencies live in requirements.txt (ADR-002) as the single source of truth.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]

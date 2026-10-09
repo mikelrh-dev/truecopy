@@ -1,0 +1,41 @@
+# openspec/config.yaml
+schema: spec-driven
+
+context: |
+  Tech stack: greenfield (zero code). Intended per use case: Python, PyMuPDF ingestion,
+    Qdrant vector DB, BGE-M3 embeddings (CPU), Ollama Qwen2.5 7B local LLM, Streamlit web UI.
+  Architecture: local-only RAG over machine manuals; LAN web access + basic login;
+    FIFO queue with safety priority, 45s timeout; single current manual with revision metadata.
+  Testing: no test runner, linter, type checker, or formatter detected (no code yet).
+  Style: no conventions detected yet; Spanish UI/answers over English PDFs; SDD artifacts in English.
+
+rules:
+  proposal:
+    - Include a rollback plan for risky changes
+    - Keep phase-1 scope to text-only Siemens 828D manual (Haas images deferred)
+    - Never send documentation outside the machine: no external APIs, local/LAN only
+    - Stay within hardware budget: 16GB RAM / 8GB VRAM server PC
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Answer contract: always cite Manual + Page, never invent, safety topics carry warnings
+    - Operator-facing text in Spanish; manual content is English (cross-lingual ES->EN)
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+    - Respect 16GB RAM / 8GB VRAM limits (batch ingestion, mmap storage, 7-8B Q4 model max)
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+  apply:
+    guidelines:
+      - No code exists yet: establish project conventions with the first modules
+      - Follow existing code patterns once they appear
+    tdd: false          # no test runner detected; re-evaluate once a runner lands
+    test_command: ""
+  verify:
+    test_command: "pytest tests"
+    build_command: ""
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
