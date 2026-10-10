@@ -485,3 +485,45 @@ def test_the_refusal_render_path_uses_the_answer_text() -> None:
     rendered = inspect.getsource(web_app._render_answer)
     assert "answer.text_es" in rendered
     assert "ANSWER_UNASSIGNED" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# feedback widget: placement and Spanish strings (operator-feedback spec)
+# ---------------------------------------------------------------------------
+
+
+def test_the_feedback_widget_lives_in_the_question_page_not_the_render() -> None:
+    # _render_answer must stay a PURE render of what the pipeline produced;
+    # the rating control is page/session state, so the design pins it in
+    # _page_question, right after the render call.
+    import inspect
+
+    from web import app as web_app
+
+    rendered = inspect.getsource(web_app._render_answer)
+    page = inspect.getsource(web_app._page_question)
+    assert "_feedback_widget" not in rendered
+    assert "_feedback_widget(" in page
+    assert page.index("_render_answer(") < page.index("_feedback_widget(")
+
+
+def test_the_widget_only_offers_rating_for_answer_and_refusal_kinds() -> None:
+    import inspect
+
+    from web import app as web_app
+
+    widget = inspect.getsource(web_app._feedback_widget)
+    assert '"answer"' in widget and '"refusal"' in widget
+    assert '"timeout"' not in widget  # a timeout notice is not rateable
+
+
+def test_feedback_strings_exist_in_spanish() -> None:
+    from web import ui_es
+
+    assert ui_es.FEEDBACK_LABEL
+    assert ui_es.FEEDBACK_DONE
+    assert ui_es.FEEDBACK_THUMBS_UP
+    assert ui_es.FEEDBACK_THUMBS_DOWN
+    assert ui_es.FEEDBACK_THUMBS_UP != ui_es.FEEDBACK_THUMBS_DOWN
+    # Spanish chrome, per the "Spanish UI" contract.
+    assert "útil" in (ui_es.FEEDBACK_THUMBS_UP + ui_es.FEEDBACK_THUMBS_DOWN).lower()
