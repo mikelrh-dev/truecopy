@@ -7,7 +7,7 @@ Produce operator-Spanish answers under a strict contract: cite Manual + Page, ne
 ## Assumptions
 
 - **A1** — A "<5s" response is a nice-to-have target; the contractual limit is the 45s timeout covering queue wait + generation.
-- **A4** — The three mandatory checks start as manual spot-checks; a scripted eval set SHALL land once a test runner exists.
+- **A4** — The mandatory evaluation set is scripted (`scripts/eval.py`) and runs against a live stack; the hermetic pytest suite is a separate gate that needs neither Qdrant nor Ollama.
 
 ## Requirements
 
@@ -86,6 +86,8 @@ The system SHALL cover three mandatory checks: alarm-code retrieval, ES→EN ret
 ### Requirement: Opt-in calibration recording in eval
 
 The eval entry point SHALL accept an additive `--record` flag. Without `--record`, eval SHALL write NOTHING: no calibration file is created, read, or appended. With `--record`, eval SHALL append exactly one calibration record and MUST NOT mutate `config.MIN_SCORE`. In both modes, checks, printed lines, and exit codes SHALL remain unchanged, including the report-only line stating that eval did not change `config.MIN_SCORE`.
+
+The record is appended only after every check passes AND the calibration sweep produced at least one threshold point: a fully passing eval whose sweep is empty appends nothing (design decision 8 — an empty sweep carries no separating threshold to recommend, and a record without one would claim otherwise).
 
 #### Scenario: No flag, no writes
 
