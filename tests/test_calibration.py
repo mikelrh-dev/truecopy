@@ -425,3 +425,27 @@ def test_calibration_path_env_override_and_empty_value_disables() -> None:
         else:
             os.environ["PLANT_RAG_CALIBRATION_PATH"] = previous
         importlib.reload(config)
+
+
+# --- Phase 5: anti-import guard (serving stays record-free) ----------------
+
+
+def test_serving_packages_never_import_the_calibration_store() -> None:
+    """``retrieve/`` and ``answer/`` must never import the calibration module.
+
+    Eval informs; the owner applies. Serving resolution stays env over
+    config default — records never participate in MIN_SCORE, and the
+    advisory is CLI-only (ingest). Source-scan precedent:
+    ``tests/test_pipeline.py`` (eval source assertions).
+    """
+    package_root = Path(calibration.__file__).resolve().parents[1]
+    offenders: list[str] = []
+    for package in ("retrieve", "answer"):
+        for path in sorted((package_root / package).rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            if (
+                "plant_rag.calibration" in source
+                or "from plant_rag import calibration" in source
+            ):
+                offenders.append(str(path.relative_to(package_root)))
+    assert offenders == []
