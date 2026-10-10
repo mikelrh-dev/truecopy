@@ -82,6 +82,15 @@ above / out-of-corpus below the current floor.
 
 ## 3. Multi-manual (roadmap item 5)
 
+**Design resolved 2026-10-10 (design-only, not implemented):** the open
+questions are answered in `openspec/changes/2026-10-10-multi-manual/proposal.md`
+— per-manual collections `manual__{id}__r{N}__{text,alarms}` with per-manual
+aliases (the aliases ARE the live-manual registry), per-manual revisions, an
+explicit scoped retrieval ("all manuals" is a separate Phase B with its own
+slot-policy decision), and a cache key that gains `(manual_id, scope)`. The
+phased plan is A1 topology → A2 per-manual reindex → A3 cache → A4 eval →
+A5 UI → B cross-manual merge. Each phase is its own SDD/verify cycle.
+
 **Shipped:** exactly one current corpus by design (ADR-001 blue/green: build
 `r{N+1}`, validate counts, swap `current_text`/`current_alarms` atomically,
 delete the old). `manual_id` is already carried in payloads, citations,
