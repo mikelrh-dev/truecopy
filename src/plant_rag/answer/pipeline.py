@@ -213,6 +213,7 @@ def answer_question(
 
     started = time.monotonic()
     qdrant = client
+    revision: int | None = None
 
     if cache is not None:
         # ONE client for lookup, chain, and re-check. The key needs the
@@ -233,12 +234,21 @@ def answer_question(
                         cached,
                         time.monotonic() - started,
                         model=config.OLLAMA_MODEL,
+                        revision=_revision_tag(revision),
                     )
                 )
             return cached
 
     # Miss (or no cache): the full chain. Timeouts and LLM errors
     # propagate here, BEFORE any store, so they can never be cached.
+    if revision is None and log is not None:
+        # The log must record WHICH corpus produced the answer (the same
+        # provenance the calibration advisory warns about): one alias read
+        # per operator question. Eval traffic passes no log and pays nothing.
+        if qdrant is None:
+            qdrant = QdrantClient(url=config.QDRANT_URL, timeout=10)
+        revision = current_revision(qdrant)
+
     answer = _answer_question(
         question,
         remaining_s,
@@ -252,7 +262,6 @@ def answer_question(
             )
         ),
     )
-
     if cache is not None:
         # Store only if the corpus did not move under the chain's feet
         # (the re-check runs on the miss path only). A store failure must
@@ -270,9 +279,15 @@ def answer_question(
                 answer,
                 time.monotonic() - started,
                 model=config.OLLAMA_MODEL,
+                revision=_revision_tag(revision),
             )
         )
     return answer
+
+
+def _revision_tag(revision: int | None) -> str:
+    """``3`` -> ``"r3"``; ``None`` -> ``""`` (no corpus resolved yet)."""
+    return "" if revision is None else f"r{revision}"
 
 
 def _answer_question(

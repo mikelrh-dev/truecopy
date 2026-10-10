@@ -57,6 +57,7 @@ def test_a_decline_next_to_a_full_pool_records_one_signal(
 ) -> None:
     """Detection only: the answer is untouched; the event carries the pool."""
     _stub_full_pool(monkeypatch, (98, 99, 205, 206, 294))
+    monkeypatch.setattr(pipeline, "current_revision", lambda client: 3)
     transport = _DeclineTransport()
     log = QueryLog(tmp_path / "queries.jsonl")
 
@@ -77,11 +78,55 @@ def test_a_decline_next_to_a_full_pool_records_one_signal(
     assert signals[0]["manual_id"] == "Owners_Manual"
 
 
+def test_a_logged_answer_records_the_corpus_revision(monkeypatch, tmp_path) -> None:
+    """The log must answer "which corpus produced this" (audit A2).
+
+    ``build_record`` used to hardcode an empty revision, so after a reindex
+    nothing in the history could be tied to the corpus that produced it.
+    """
+    monkeypatch.setattr(pipeline, "current_revision", lambda client: 4)
+    monkeypatch.setattr(pipeline, "retrieve_pool", lambda client, q, v: _hits((11,)))
+    monkeypatch.setattr(
+        pipeline, "rerank", lambda q, hits, *, top_k=5, **kw: tuple(hits)[:top_k]
+    )
+    log = QueryLog(tmp_path / "queries.jsonl")
+
+    pipeline.answer_question(
+        "pregunta", 30.0, client=_NoopClient(), transport=_DeclineTransport(), log=log
+    )
+
+    records = log.records()
+    assert [r.revision for r in records] == ["r4"]
+
+
+def test_a_cached_hit_also_logs_its_revision(monkeypatch, tmp_path) -> None:
+    """The hit path and the miss path must carry the same provenance."""
+    monkeypatch.setattr(pipeline, "current_revision", lambda client: 9)
+    monkeypatch.setattr(pipeline, "retrieve_pool", lambda client, q, v: _hits((11,)))
+    monkeypatch.setattr(
+        pipeline, "rerank", lambda q, hits, *, top_k=5, **kw: tuple(hits)[:top_k]
+    )
+    cache = AnswerCache(tmp_path / "cache.jsonl")
+    log = QueryLog(tmp_path / "queries.jsonl")
+
+    pipeline.answer_question(
+        "pregunta", 30.0, client=_NoopClient(), transport=_DeclineTransport(),
+        log=log, cache=cache,
+    )
+    pipeline.answer_question(
+        "pregunta", 30.0, client=_NoopClient(), transport=_DeclineTransport(),
+        log=log, cache=cache,
+    )
+
+    assert [r.revision for r in log.records()] == ["r9", "r9"]
+
+
 def test_a_decline_next_to_a_thin_pool_records_no_signal(
     monkeypatch, tmp_path
 ) -> None:
     """A thin pool makes the decline plausible: detection must stay silent."""
     _stub_full_pool(monkeypatch, (98, 99))
+    monkeypatch.setattr(pipeline, "current_revision", lambda client: 3)
     log = QueryLog(tmp_path / "queries.jsonl")
 
     answer = pipeline.answer_question(
