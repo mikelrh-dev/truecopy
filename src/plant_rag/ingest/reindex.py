@@ -39,6 +39,7 @@ from qdrant_client.http.models import (
 from plant_rag import config
 from plant_rag.ingest.alarms import AlarmRow, extract_alarms
 from plant_rag.ingest.chunker import ChildChunk, ParentChunk, chunk_page
+from plant_rag.ingest.figures import save_page_figures
 from plant_rag.ingest.loader import iter_batches
 from plant_rag.retrieve.store import (
     ALARMS_ALIAS,
@@ -206,6 +207,7 @@ def run_reindex(
     previous = current_revision(client)
     text_points = 0
     alarm_points = 0
+    figure_pages: set[int] = set()
 
     try:
         # Collections exist before any data: an interrupted run can never be
@@ -218,6 +220,8 @@ def run_reindex(
         for batch in iter_batches(pdf_path, batch_pages):
             pairs: list[tuple[ParentChunk, ChildChunk]] = []
             alarm_rows: list[tuple[int, AlarmRow]] = []
+            batch_figure_pages = {page.number for page in batch if page.has_figures}
+            figure_pages |= batch_figure_pages
             for page in batch:
                 parent, page_children = chunk_page(
                     page, manual_id=manual_id, revision=revision_tag
@@ -269,6 +273,11 @@ def run_reindex(
                                 "parent_id": child.parent_id,
                                 "child_text": child.text,
                                 "parent_text": parent.text,
+                                # A figure rides BESIDE the answer, never in it
+                                # (answering spec): the web shows the page's
+                                # saved figure only when this flag is set AND
+                                # the file exists.
+                                "has_figures": child.page in batch_figure_pages,
                             },
                         )
                         for (parent, child), vector in zip(pairs, vectors)
@@ -302,6 +311,19 @@ def run_reindex(
 
         if text_points == 0:
             raise ValueError(f"no indexable text found in {pdf_path}")
+        # Save the flagged pages' figures BEFORE the swap: a figure is a trust
+        # aid, so a disk failure must never abort a revision (best-effort).
+        if figure_pages and str(config.FIGURES_DIR).strip():
+            try:
+                save_page_figures(
+                    pdf_path,
+                    sorted(figure_pages),
+                    figures_dir=config.FIGURES_DIR,
+                    revision=revision_tag,
+                    manual_id=manual_id,
+                )
+            except Exception:  # noqa: BLE001 - figures never fail an ingest
+                pass
         validate_revision(client, revision, text_points, alarm_points)
         swap_aliases(client, revision)
     except BaseException:

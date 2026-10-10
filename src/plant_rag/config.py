@@ -119,6 +119,17 @@ if RERANK_POOL < TOP_K:
 # the 2.5GB fp32 RAM line from ADR-002 without slowing encoding down.
 EMBED_BATCH_SIZE = _env_int("EMBED_BATCH_SIZE", 32)
 
+# --- Figures (phase-1 image support, heuristic, no vision model) -----------
+# Directory where the ingest pipeline saves the largest embedded figure of
+# each page that HAS one, so the web can show it beside a cited page's excerpt
+# ("[IMAGEN] handling", deferred in the original proposal). The layout is
+# ``<dir>/<revision>/<manual_id>/page-<N>.png``; the web derives the path and
+# only loads it when the file exists. Extraction is PyMuPDF-only (already a
+# dependency): NO vision model, no new download, no VRAM — the ADR-002 budget
+# stays intact. Set to "" to disable figure extraction entirely (the ingest
+# then writes no files and every page's ``has_figures`` payload flag is False).
+FIGURES_DIR = _env_str("FIGURES_DIR", "data/figures")
+
 # --- Answering -------------------------------------------------------------
 # Relevance floor for semantic hits (decision deferred from Unit 3, closed
 # here with its measurements): BGE-M3 cosine scores measured live against the

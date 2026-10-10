@@ -542,6 +542,52 @@ def test_cited_excerpts_fail_open_when_the_corpus_is_unreachable(
     assert web_app._cited_excerpts(answer.citations) == {}
 
 
+def test_cited_page_payloads_expose_the_revision_and_figure_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web import app as web_app
+
+    client = _FakeScrollClient(
+        [
+            {"manual_id": "M", "page": 98, "parent_text": "t", "revision": "r3", "has_figures": True},
+            {"manual_id": "M", "page": 39, "parent_text": "u", "revision": "r3"},
+        ]
+    )
+    monkeypatch.setattr(
+        "qdrant_client.QdrantClient", lambda *a, **kw: client, raising=True
+    )
+    from plant_rag.models import Citation
+
+    payloads = web_app._cited_page_payloads((Citation("M", 98), Citation("M", 39)))
+
+    assert payloads[("M", 98)]["has_figures"] is True
+    assert payloads[("M", 39)]["has_figures"] is False
+    assert payloads[("M", 98)]["revision"] == "r3"
+
+
+def test_cited_figure_returns_the_file_only_when_it_exists(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plant_rag import config
+    from plant_rag.ingest.figures import figure_path
+    from plant_rag.models import Citation
+    from web import app as web_app
+
+    monkeypatch.setattr(config, "FIGURES_DIR", str(tmp_path))
+    meta = {"text": "t", "revision": "r3", "has_figures": True}
+    citation = Citation("M", 98)
+
+    assert web_app._cited_figure(citation, meta) is None  # flagged but absent
+
+    target = figure_path(config.FIGURES_DIR, "r3", "M", 98)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"png")
+
+    assert web_app._cited_figure(citation, meta) == target
+    # A page without the flag never looks for a file.
+    assert web_app._cited_figure(citation, {"has_figures": False}) is None
+
+
 # ---------------------------------------------------------------------------
 # refusal display: the UI shows the exact contract string, never a paraphrase
 # ---------------------------------------------------------------------------

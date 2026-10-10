@@ -651,13 +651,15 @@ def _run_question(
     return answer
 
 
-def _cited_excerpts(citations: tuple) -> dict[tuple[str, int], str]:
-    """Fetch the manual passage behind each citation from the live corpus.
+def _cited_page_payloads(citations: tuple) -> dict[tuple[str, int], dict]:
+    """Fetch the passage payload behind each citation from the live corpus.
 
     One scroll over the current revision, filtered to the cited pages: the
-    operator verifies the answer without opening the PDF. A failure (Qdrant
-    down, alias missing) returns an empty map — the excerpt is a trust aid,
-    never a requirement for showing the answer.
+    operator verifies the answer without opening the PDF. Returns the parent
+    text, the corpus revision, and the page's ``has_figures`` flag so the
+    render can show the saved figure beside the excerpt when one exists. A
+    failure (Qdrant down, alias missing) returns an empty map — verification
+    aids are never a reason to withhold the answer.
     """
     if not citations:
         return {}
@@ -693,16 +695,54 @@ def _cited_excerpts(citations: tuple) -> dict[tuple[str, int], str]:
             with_payload=True,
             with_vectors=False,
         )
-        excerpts: dict[tuple[str, int], str] = {}
+        payloads: dict[tuple[str, int], dict] = {}
         for point in points:
             payload = point.payload or {}
             key = (str(payload.get("manual_id", "")), int(payload.get("page", 0)))
-            text = str(payload.get("parent_text", "")).strip()
-            if text and key not in excerpts:
-                excerpts[key] = text
-        return excerpts
+            if key not in payloads:
+                payloads[key] = {
+                    "text": str(payload.get("parent_text", "")).strip(),
+                    "revision": str(payload.get("revision", "")).strip(),
+                    "has_figures": bool(payload.get("has_figures", False)),
+                }
+        return payloads
     except Exception:
         return {}
+
+
+def _cited_excerpts(citations: tuple) -> dict[tuple[str, int], str]:
+    """The parent text behind each citation (thin wrapper over the payloads)."""
+    return {
+        key: meta["text"]
+        for key, meta in _cited_page_payloads(citations).items()
+        if meta["text"]
+    }
+
+
+def _cited_figure(citation, meta: dict):
+    """The saved figure path for one cited page, or ``None`` when there is none.
+
+    The figure is a trust aid appended BESIDE the excerpt, never part of the
+    answer contract: it shows only when the page was flagged at ingest AND the
+    file exists on disk. Any failure (disabled dir, missing file) degrades to
+    the text excerpt alone.
+    """
+    if not meta.get("has_figures"):
+        return None
+    try:
+        if not str(config.FIGURES_DIR).strip():
+            return None
+        from plant_rag.ingest.figures import figure_path
+
+        path = figure_path(
+            config.FIGURES_DIR,
+            meta.get("revision", ""),
+            citation.manual_id,
+            citation.page,
+        )
+        return path if path.is_file() else None
+    except Exception:  # noqa: BLE001 - a missing figure never breaks the render
+        return None
 
 
 def _render_answer(answer: Answer | None) -> None:
@@ -729,7 +769,7 @@ def _render_answer(answer: Answer | None) -> None:
 
     if answer.citations:
         st.subheader(ANSWER_CITATIONS_LABEL)
-        excerpts = _cited_excerpts(answer.citations)
+        payloads = _cited_page_payloads(answer.citations)
         seen: set[tuple[str, int]] = set()
         for citation in answer.citations:
             key = (citation.manual_id, citation.page)
@@ -737,12 +777,16 @@ def _render_answer(answer: Answer | None) -> None:
                 continue  # the answer often cites the same page per step
             seen.add(key)
             st.caption(f"[Fuente: {citation.manual_id} Página {citation.page}]")
-            excerpt = excerpts.get(key)
+            meta = payloads.get(key)
+            excerpt = meta["text"] if meta else None
             if excerpt:
                 with st.expander(
                     f"{ANSWER_EXCERPT_LABEL} {citation.page}", expanded=False
                 ):
                     st.text(excerpt[:2000])
+                    figure = _cited_figure(citation, meta)
+                    if figure is not None:
+                        st.image(str(figure), caption=f"Página {citation.page}")
 
 
 def _feedback_widget(answer: Answer | None) -> None:

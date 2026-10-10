@@ -48,6 +48,12 @@ class Page:
     text: str
     tables: tuple[TableGrid, ...] = ()
     section: str | None = None
+    #: True when the page embeds at least one raster image. The flag alone is
+    #: captured here (cheap, no bytes): the bytes are extracted later, one page
+    #: at a time, by ``ingest.figures`` — so a batch never carries image data
+    #: and the ADR-002 RSS bound is untouched. Text-only pages stay False and
+    #: pay nothing.
+    has_figures: bool = False
 
     def __post_init__(self) -> None:
         if self.number < 1:
@@ -119,6 +125,7 @@ def iter_batches(
                         table.extract() for table in handle.find_tables().tables
                     ),
                     section=sections.get(index + 1),
+                    has_figures=bool(handle.get_images(full=False)),
                 )
             )
             if len(batch) >= batch_pages:
