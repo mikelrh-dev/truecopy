@@ -114,3 +114,19 @@ if QUERY_DEADLINE_S < 1:
 # web layer and the CLI wire it; the eval does not (its traffic is not
 # operator traffic). Set to "" to disable query logging entirely.
 QUERY_LOG_PATH = _env_str("QUERY_LOG_PATH", "logs/queries.jsonl")
+
+# --- Answer cache -----------------------------------------------------------
+# Revision-scoped operator answer cache (append-only JSONL + in-memory LRU,
+# best-effort, disposable). Key = (revision, model, normalize(question)), so
+# a reindex or a model swap invalidates by construction; wipe the file to
+# invalidate answer-relevant config changes (min-score, glossary, safety
+# terms, prompt) — the documented v1 contract, no config fingerprint yet.
+# Set to "" to disable the cache entirely (eval traffic runs cache-disabled
+# and never touches it).
+ANSWER_CACHE_PATH = _env_str("ANSWER_CACHE_PATH", "logs/answer-cache.jsonl")
+ANSWER_CACHE_MAX_ENTRIES = _env_int("ANSWER_CACHE_MAX_ENTRIES", 1000)
+if ANSWER_CACHE_MAX_ENTRIES < 1:
+    raise ValueError(
+        f"{_ENV_PREFIX}ANSWER_CACHE_MAX_ENTRIES must be >= 1, "
+        f"got {ANSWER_CACHE_MAX_ENTRIES}"
+    )
