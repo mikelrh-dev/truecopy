@@ -92,6 +92,24 @@ tests/              suite hermética (sin Qdrant ni Ollama)
 - Owner: subir PDF (UUID), reindexar vía CLI, gestionar códigos.
 - Rollback por paquetes o reset total (`down -v` + borrar datos; el núcleo intacto).
 
+## Acceso LAN y regla de firewall (ADR-006)
+
+La app escucha en `0.0.0.0:8501` para llegar a la LAN; la regla de firewall
+es la frontera que la mantiene alcanzable only from the LAN subnet:
+
+```bash
+# Ejemplo iptables (subred del operador): aceptar la subred, tirar el resto.
+sudo iptables -A INPUT -p tcp --dport 8501 -s 192.0.2.0/24 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8501 -j DROP
+```
+
+```powershell
+# Ejemplo Windows Defender (PowerShell, admin):
+New-NetFirewallRule -DisplayName "TrueCopy Streamlit LAN" `
+  -Direction Inbound -Protocol TCP -LocalPort 8501 `
+  -Action Allow -RemoteAddress 192.0.2.0/24  # ejemplo: pon tu subred LAN
+```
+
 ## Convenciones
 
 - Código y comentarios en inglés; UI/errores en español; extractos del manual
