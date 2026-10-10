@@ -40,7 +40,7 @@ Mapa completo: [ARQUITECTURA.md](ARQUITECTURA.md).
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\python -m pytest tests -q   # 229 tests herméticos, sin servicios
+.\.venv\Scripts\python -m pytest tests -q   # 339 tests herméticos, sin servicios
 
 docker compose up -d                          # Qdrant en 127.0.0.1:6333
 ollama pull qwen2.5:7b-instruct               # LLM en el host (VRAM libre)

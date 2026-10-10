@@ -758,3 +758,94 @@ def test_alias_and_naming_contract_shared_with_ingestion() -> None:
     assert current_target(fake, store.TEXT_ALIAS) is None
     fake.alias("current_text", "manual_r3_text")
     assert current_target(fake, store.TEXT_ALIAS) == "manual_r3_text"
+
+
+# --- CPU cross-encoder: ordering, degradation, boundary (injected scorer) ---
+
+
+def _hits(pages: tuple[int, ...]) -> tuple:
+    from plant_rag.models import Hit
+
+    return tuple(
+        Hit(manual_id="M", page=p, revision="r1", child=f"c{p}", parent=f"p{p}")
+        for p in pages
+    )
+
+
+def _scores_in_order(values: list[float]):
+    """A scorer that hands back ``values`` in call order, recording pairs."""
+
+    def score(pairs: list[tuple[str, str]]) -> list[float]:
+        return values
+
+    return score
+
+
+def test_rerank_orders_by_score_and_cuts_to_top_k() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    hits = _hits((10, 20, 30, 40, 50, 60))
+    ordered = rerank("pregunta", hits, top_k=3, scorer=_scores_in_order([0.1, 0.9, 0.5, 0.3, 0.8, 0.2]))
+
+    assert [h.page for h in ordered] == [20, 50, 30]
+
+
+def test_rerank_resolves_ties_in_incoming_order() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    hits = _hits((10, 20, 30))
+    ordered = rerank("pregunta", hits, top_k=3, scorer=_scores_in_order([0.5, 0.5, 0.5]))
+
+    assert [h.page for h in ordered] == [10, 20, 30]  # stable: retrieval order
+
+
+def test_rerank_with_an_empty_pool_never_loads_the_scorer() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    def exploding_scorer(pairs):
+        raise AssertionError("an empty pool must not load the cross-encoder")
+
+    assert rerank("pregunta", (), top_k=5, scorer=exploding_scorer) == ()
+
+
+def test_rerank_keeps_retrieval_order_when_scoring_fails() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    def broken_scorer(pairs):
+        raise RuntimeError("scoring failed")
+
+    hits = _hits((10, 20, 30))
+    kept = rerank("pregunta", hits, top_k=2, scorer=broken_scorer)
+
+    assert [h.page for h in kept] == [10, 20]  # degraded, never loud
+
+
+def test_rerank_keeps_retrieval_order_when_the_model_cannot_load(
+    monkeypatch,
+) -> None:
+    from plant_rag.retrieve import rerank as rerank_mod
+
+    def unavailable():
+        raise OSError("weights not on disk")
+
+    monkeypatch.setattr(rerank_mod, "_default_scorer", unavailable)
+    hits = _hits((10, 20, 30))
+
+    assert [h.page for h in rerank_mod.rerank("pregunta", hits, top_k=2)] == [10, 20]
+
+
+def test_rerank_rejects_a_score_count_that_does_not_match_the_pool() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    with pytest.raises(ValueError, match="scores"):
+        rerank("pregunta", _hits((10, 20)), top_k=2, scorer=_scores_in_order([0.5]))
+
+
+def test_rerank_without_a_configured_model_truncates_in_order(monkeypatch) -> None:
+    from plant_rag import config
+    from plant_rag.retrieve.rerank import rerank
+
+    monkeypatch.setattr(config, "RERANK_MODEL", "")
+    hits = _hits((10, 20, 30))
+
+    assert [h.page for h in rerank("pregunta", hits, top_k=2)] == [10, 20]

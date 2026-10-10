@@ -7,8 +7,9 @@ would otherwise load real checkpoints:
   BGE-M3 costs seconds and ~2.5GB of RAM (ADR-002); a suite that must run
   offline and fast cannot pay that per session.
 * ``pipeline.rerank`` -> a retrieval-order cut to ``top_k``. The CPU
-  cross-encoder (~2.3GB) is exercised by ``tests/test_rerank.py`` with an
-  injected scorer and live by ``scripts/eval.py`` - never by accident here.
+  cross-encoder (~2.3GB) has its own unit coverage with an injected scorer
+  in ``tests/test_retrieve.py``; the real weights load only through the
+  live ``scripts/eval.py`` - never by accident here.
 
 Tests that need different behavior override these seams with their own
 ``monkeypatch.setattr(pipeline, ...)``; the real models stay behind the live
