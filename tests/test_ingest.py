@@ -773,3 +773,31 @@ def test_reindex_cli_prints_the_same_calibration_advisory(
     assert "OK — revisión r3 en servicio" in out  # the summary comes first
     assert "Sugerencia de calibración [fresh]" in out
     assert "separates this labeled set" in out
+
+
+def test_manual_id_from_filename_is_the_single_sanitized_identity() -> None:
+    """One helper owns the identity, so the file names the manual everywhere.
+
+    The web upload stages bytes under a UUID name and the CLI reads a path, but
+    both derive the SAME id from the manual's own filename (audit A1).
+    """
+    from plant_rag.ingest.reindex import manual_id_from_filename
+
+    assert manual_id_from_filename("manual de calidad.pdf") == "manual_de_calidad"
+    assert manual_id_from_filename("828D-manual.pdf") == "828D_manual"
+    assert manual_id_from_filename("carpeta/manual.pdf") == "manual"
+    assert manual_id_from_filename("...pdf") == "manual-sin-nombre"
+    assert manual_id_from_filename("Manual.pdf") == manual_id_from_filename("Manual.pdf")
+
+
+def test_ingest_cli_derives_its_id_from_the_filename_when_no_flag(
+    tmp_path, monkeypatch
+) -> None:
+    """Without ``--manual-id`` the ingest CLI uses the same filename identity."""
+    import scripts.ingest as ingest_cli
+
+    calls = _patch_ingest_harness(monkeypatch, tmp_path, "")
+    pdf = make_pdf(tmp_path / "manual de calidad.pdf", ["body"])
+
+    assert ingest_cli.main([str(pdf)]) == 0
+    assert calls[0]["manual_id"] == "manual_de_calidad"
