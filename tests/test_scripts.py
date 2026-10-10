@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -350,3 +351,59 @@ def test_eval_record_never_appends_when_any_check_fails(tmp_path, monkeypatch) -
 
     assert eval_cli.main(["--record"]) == 1
     assert not cal_path.exists()
+
+
+def test_check_golden_grounding_maps_real_pass_and_total_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production count wiring of ``check_golden_grounding``, not a fake.
+
+    Existing record tests inject the counts through a fake, which leaves the
+    real success/failure counting unproven. This test drives the actual
+    function: the passing shape carries both counts, the failing shape
+    carries ``None`` for both (rendered later as "golden n/d").
+    """
+    import scripts.eval as eval_cli
+    from plant_rag.models import Hit
+    from scripts.eval import GoldenCase, ManualGoldenSet
+
+    monkeypatch.setattr(
+        eval_cli, "current_target", lambda client, alias: "manual_r3_text"
+    )
+    monkeypatch.setattr(
+        eval_cli,
+        "get_embedder",
+        lambda: SimpleNamespace(encode=lambda texts: [[0.0] for _ in texts]),
+    )
+
+    golden_set = ManualGoldenSet(
+        manual_id="828D_DA_1015_en_en_US",
+        cases=(
+            GoldenCase("10730", frozenset({100})),
+            GoldenCase("presion neumaticos", frozenset({98})),
+        ),
+        expect_alarms=True,
+    )
+
+    def _hits(*pages: int) -> tuple[Hit, ...]:
+        return tuple(
+            Hit(manual_id="m", page=page, revision="r3", child="c", parent="p")
+            for page in pages
+        )
+
+    class _Client:
+        pass
+
+    # Every case lands on an expected page → passed=True with both counts.
+    monkeypatch.setattr(
+        eval_cli, "retrieve_and_rank", lambda client, query: _hits(100, 98)
+    )
+    passed = eval_cli.check_golden_grounding(_Client(), golden_set)
+    assert passed.passed is True
+    assert (passed.golden_pass, passed.golden_total) == (2, 2)
+
+    # One case misses its golden page → passed=False with None for both.
+    monkeypatch.setattr(eval_cli, "retrieve_and_rank", lambda client, query: _hits(100))
+    failed = eval_cli.check_golden_grounding(_Client(), golden_set)
+    assert failed.passed is False
+    assert failed.golden_pass is None and failed.golden_total is None

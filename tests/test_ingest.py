@@ -664,6 +664,30 @@ def test_ingest_stale_record_is_downgraded_not_hidden(
     assert "separates this labeled set" in out  # downgraded, never hidden
 
 
+def test_ingest_hard_stale_when_the_stored_revision_differs(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The spec GIVEN end-to-end: a record stored under an older revision.
+
+    The seed below writes revision ``r2`` while the reindex lands ``r3``, so
+    the advisory must label the record hard-stale (revision mismatch) — not
+    the age-based soft-stale path — while still showing its content.
+    """
+    import scripts.ingest as ingest_cli
+
+    cal_path = tmp_path / "calibration.jsonl"
+    _seed_calibration_record(cal_path, revision="r2")
+    _patch_ingest_harness(monkeypatch, tmp_path, str(cal_path))
+    pdf = make_pdf(tmp_path / "v.pdf", ["body"])
+
+    assert ingest_cli.main([str(pdf), "--manual-id", "828D"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Aviso [hard-stale]" in out
+    assert "separates this labeled set" in out  # downgraded, never hidden
+    assert "golden 8/8" in out  # counts and date travel with the stale line
+
+
 def test_ingest_with_empty_path_prints_nothing_extra(
     tmp_path, monkeypatch, capsys
 ) -> None:
