@@ -15,7 +15,14 @@ import time
 from pathlib import Path
 
 from plant_rag.monitoring import FeedbackRecord
-from scripts.feedback_report import aggregate, format_table, main, topic_key
+from scripts.feedback_report import (
+    aggregate,
+    aggregate_signals,
+    format_signals,
+    format_table,
+    main,
+    topic_key,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "feedback_report.py"
@@ -208,3 +215,128 @@ def test_help_exits_zero() -> None:
 
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
     assert "usage:" in result.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# decline-signal detection view (--signals, roadmap item 4 phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _write_signal_log(path: Path, entries: list[tuple[str, int, float]]) -> Path:
+    """Write decline-signal lines shaped as the writer emits them.
+
+    ``entries`` are ``(question, pool_size, age_seconds)``.
+    """
+    now = time.time()
+    lines = [
+        json.dumps(
+            {
+                "event": "decline-strong-pool",
+                "ts": now - age,
+                "question": question,
+                "pool_size": pool_size,
+                "pages": [98, 99],
+                "manual_id": "Owners_Manual",
+                "revision": "r3",
+                "model": "m",
+            },
+            ensure_ascii=False,
+        )
+        for question, pool_size, age in entries
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_signals_view_counts_and_orders_like_the_vote_view(tmp_path) -> None:
+    log = _write_signal_log(
+        tmp_path / "queries.jsonl",
+        [
+            ("limite de velocidad", 5, 100),
+            ("limite de velocidad", 4, 200),
+            ("testigos del cuadro", 5, 100),
+            ("pregunta vieja", 5, 9 * DAY_S),  # outside the window
+        ],
+    )
+
+    result = _run(["--signals", "--log", str(log)])
+
+    assert result.returncode == 0, f"stderr:\n{result.stderr}"
+    assert "Decline signals" in result.stdout
+    assert result.stdout.index("limite de velocidad") < result.stdout.index(
+        "testigos cuadro"
+    )  # 2 signals beat 1; "del" is a stopword, "de" is not
+    assert "pregunta vieja" not in result.stdout  # window respected
+
+
+def test_signals_view_json_carries_pool_and_pages(tmp_path) -> None:
+    log = _write_signal_log(tmp_path / "queries.jsonl", [("cambio de filtro", 5, 100)])
+
+    result = _run(["--signals", "--log", str(log), "--json"])
+
+    assert result.returncode == 0, f"stderr:\n{result.stderr}"
+    payload = json.loads(result.stdout)
+    assert payload["signals"] == [
+        {
+            "topic": "cambio de filtro",  # "de" is not a stopword: kept verbatim
+            "count": 1,
+            "pool_size": 5,
+            "pages": [98, 99],
+            "last_ts": payload["signals"][0]["last_ts"],
+        }
+    ]
+
+
+def test_signals_view_fails_loudly_on_an_unreadable_log(tmp_path) -> None:
+    missing = tmp_path / "absent.jsonl"
+
+    result = _run(["--signals", "--log", str(missing)])
+
+    assert result.returncode == 1
+    assert "cannot read log" in result.stderr
+    assert "Decline signals" not in result.stdout
+
+
+def test_aggregate_signals_keeps_the_newest_pool_per_topic() -> None:
+    now = 1_800_000_000.0
+
+    def event(question: str, pool: int, age: float) -> dict:
+        return {
+            "event": "decline-strong-pool",
+            "ts": now - age,
+            "question": question,
+            "pool_size": pool,
+            "pages": [98, 99],
+            "manual_id": "Owners_Manual",
+            "revision": "r3",
+            "model": "m",
+        }
+
+    rows = aggregate_signals(
+        [
+            event("mismo tema", 3, 200),
+            event("mismo tema", 5, 100),  # newer: its pool is the one shown
+            {"event": "feedback", "ts": now, "question": "voto", "vote": "down"},
+        ],
+        now=now,
+        days=7,
+        top=10,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["topic"] == "mismo tema"
+    assert rows[0]["count"] == 2
+    assert rows[0]["pool_size"] == 5  # the newest occurrence wins
+
+def test_format_signals_lists_rows_and_an_empty_window_says_so() -> None:
+    text = format_signals(
+        [{"topic": "tema beta", "count": 2, "pool_size": 5, "pages": [98, 99]}],
+        days=7,
+        top=10,
+    )
+
+    assert "tema beta" in text
+    assert "5" in text and "98,99" in text
+
+    empty = format_signals([], days=7, top=10)
+    assert "No decline-with-strong-pool" in empty

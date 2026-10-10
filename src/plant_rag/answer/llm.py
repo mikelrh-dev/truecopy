@@ -142,12 +142,31 @@ def _is_refusal_text(text: str) -> bool:
     return normalized == REFUSAL_ES.casefold()
 
 
+# A decline signal: (question, pool) -> None. Detection only — it observes a
+# decline that happened while the pool looked full and never changes the
+# answer. The pipeline binds it to the operator log; the eval never passes
+# one (harness traffic is not operator traffic), exactly like ``log=`` and
+# ``cache=`` on ``answer_question``.
+DeclineSignal = Callable[[str, tuple[Hit, ...]], None]
+
+
+def _full_pool(hits: tuple[Hit, ...]) -> bool:
+    """A "strong pool" = page-diverse candidates filled every answering slot.
+
+    Detection heuristic ONLY (roadmap item 4, phase 1): a decline next to a
+    full pool is the suspicious case worth an owner's look. It never gates,
+    retries, or alters an answer.
+    """
+    return len(hits) >= config.TOP_K
+
+
 def generate(
     question: str,
     hits: tuple[Hit, ...],
     *,
     remaining_s: float | None = None,
     transport: Transport = post_chat,
+    decline_signal: DeclineSignal | None = None,
 ) -> Answer:
     """Produce the operator's answer under the full ADR-004 contract.
 
@@ -200,6 +219,8 @@ def generate(
 
     if _is_refusal_text(text):
         # The model declined: refusal KIND, terminal, citation or not.
+        if decline_signal is not None and _full_pool(hits):
+            decline_signal(question, hits)
         return Answer(kind="refusal", text_es=REFUSAL_ES, citations=())
 
     try:
@@ -211,6 +232,8 @@ def generate(
             # pressure it into citing unrelated evidence (measured live: an
             # out-of-corpus question about cooking pasta got "answered" with
             # the horn page after such a nudge).
+            if decline_signal is not None and _full_pool(hits):
+                decline_signal(question, hits)
             return Answer(kind="refusal", text_es=REFUSAL_ES, citations=())
         # ONE bounded retry, only when the model TRIED to cite and the marker
         # failed (wrong page, unparseable, whitespace) and the budget still

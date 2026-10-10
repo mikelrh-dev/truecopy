@@ -16,6 +16,103 @@ from plant_rag.answer.cache import AnswerCache
 from plant_rag.answer.llm import DeadlineExceeded
 from plant_rag.monitoring import QueryLog
 
+
+# ---------------------------------------------------------------------------
+# decline-strong-pool detection (roadmap item 4, phase 1)
+# ---------------------------------------------------------------------------
+
+
+class _DeclineTransport:
+    """An Ollama transport whose every reply declines."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, url: str, payload: dict, timeout_s: float) -> dict:
+        self.calls += 1
+        return {"message": {"role": "assistant", "content": REFUSAL_TEXT}}
+
+
+REFUSAL_TEXT = "No aparece en la documentación"
+
+
+def _stub_full_pool(monkeypatch, pages: tuple[int, ...]) -> None:
+    """Retrieval seams that hand the chain a page-diverse pool of len(pages)."""
+    from plant_rag.models import Hit
+
+    def fake_retrieve_pool(client, question, vector, **kw):
+        return tuple(
+            Hit(manual_id="Owners_Manual", page=p, revision="r3", child="c", parent="p")
+            for p in pages
+        )
+
+    monkeypatch.setattr(pipeline, "retrieve_pool", fake_retrieve_pool)
+    monkeypatch.setattr(
+        pipeline, "rerank", lambda q, hits, *, top_k=5, **kw: tuple(hits)[:top_k]
+    )
+
+
+def test_a_decline_next_to_a_full_pool_records_one_signal(
+    monkeypatch, tmp_path
+) -> None:
+    """Detection only: the answer is untouched; the event carries the pool."""
+    _stub_full_pool(monkeypatch, (98, 99, 205, 206, 294))
+    transport = _DeclineTransport()
+    log = QueryLog(tmp_path / "queries.jsonl")
+
+    answer = pipeline.answer_question(
+        "como configuro el limite de velocidad",
+        30.0,
+        client=_NoopClient(),
+        transport=transport,
+        log=log,
+    )
+
+    assert answer.kind == "refusal"
+    assert answer.text_es == REFUSAL_TEXT
+    signals = log.event_records("decline-strong-pool")
+    assert len(signals) == 1
+    assert signals[0]["pool_size"] == 5
+    assert signals[0]["pages"] == [98, 99, 205, 206, 294]
+    assert signals[0]["manual_id"] == "Owners_Manual"
+
+
+def test_a_decline_next_to_a_thin_pool_records_no_signal(
+    monkeypatch, tmp_path
+) -> None:
+    """A thin pool makes the decline plausible: detection must stay silent."""
+    _stub_full_pool(monkeypatch, (98, 99))
+    log = QueryLog(tmp_path / "queries.jsonl")
+
+    answer = pipeline.answer_question(
+        "pregunta cualquiera",
+        30.0,
+        client=_NoopClient(),
+        transport=_DeclineTransport(),
+        log=log,
+    )
+
+    assert answer.kind == "refusal"
+    assert log.event_records("decline-strong-pool") == []
+
+
+def test_traffic_without_a_log_gets_no_decline_signal(monkeypatch, tmp_path) -> None:
+    """The seam follows log: no operator log -> no signal (eval isolation)."""
+    _stub_full_pool(monkeypatch, (98, 99, 205, 206, 294))
+    real_generate = pipeline.llm_generate
+    seen: dict = {}
+
+    def spy(question, hits, **kwargs):
+        seen.update(kwargs)
+        return real_generate(question, hits, **kwargs)
+
+    monkeypatch.setattr(pipeline, "llm_generate", spy)
+
+    pipeline.answer_question("q", 30.0, client=_NoopClient(), transport=_DeclineTransport())
+
+    assert seen.get("decline_signal") is None
+    assert not (tmp_path / "queries.jsonl").exists()
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 

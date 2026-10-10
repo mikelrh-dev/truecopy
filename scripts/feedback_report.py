@@ -8,10 +8,15 @@ top 10 topics). Topic keys are deterministic local keyword reductions
 (``keyword_variant`` over the normalized question) — no LLM, no new
 services, same bytes in, same bytes out.
 
+``--signals`` switches to the detection view (roadmap item 4, phase 1):
+decline-strong-pool events, same window and ordering, with the pool size
+and pages of the most recent occurrence per topic.
+
 Usage:
     python scripts/feedback_report.py
     python scripts/feedback_report.py --log logs/queries.jsonl --days 14 --top 5
     python scripts/feedback_report.py --json
+    python scripts/feedback_report.py --signals
 
 Exit codes:
     0 - report produced (an empty window is still a report).
@@ -109,6 +114,69 @@ def _load_feedback(path: str | Path) -> list[FeedbackRecord] | None:
     return QueryLog(log).feedback_records()
 
 
+def aggregate_signals(
+    events: list[dict], *, now: float, days: int, top: int
+) -> list[dict]:
+    """Decline-strong-pool events per topic inside the window, worst first.
+
+    Same window and ordering rules as ``aggregate`` (count descending, ties
+    alphabetical), so both views sort identically. Each row carries the pool
+    size and pages of the most recent occurrence for inspection.
+    """
+    cutoff = now - days * _DAY_S
+    buckets: dict[str, dict] = {}
+    for event in events:
+        if event.get("event") != "decline-strong-pool":
+            continue
+        ts = event.get("ts")
+        if not isinstance(ts, (int, float)) or ts < cutoff:
+            continue
+        topic = topic_key(str(event.get("question", "")))
+        bucket = buckets.setdefault(
+            topic,
+            {"topic": topic, "count": 0, "pool_size": 0, "pages": [], "last_ts": 0.0},
+        )
+        bucket["count"] += 1
+        if ts >= bucket["last_ts"]:
+            bucket["last_ts"] = float(ts)
+            bucket["pool_size"] = event.get("pool_size", 0)
+            bucket["pages"] = list(event.get("pages", []))
+    rows = sorted(buckets.values(), key=lambda row: (-row["count"], row["topic"]))
+    return rows[: max(top, 0)]
+
+
+def format_signals(rows: list[dict], *, days: int, top: int) -> str:
+    """Plain-text decline-signal report; spacing derives only from the rows."""
+    title = f"Decline signals - last {days} days, top {top} topics"
+    if not rows:
+        return f"{title}\nNo decline-with-strong-pool events in the last {days} days."
+    width = max(len("topic"), max(len(row["topic"]) for row in rows))
+    lines = [title, "", f"{'topic':<{width}}  count  pool  pages"]
+    lines.append("-" * (width + 22))
+    for row in rows:
+        pages = ",".join(str(page) for page in row["pages"]) or "-"
+        lines.append(
+            f"{row['topic']:<{width}}  {row['count']:>5}  {row['pool_size']:>4}  {pages}"
+        )
+    return "\n".join(lines)
+
+
+def _load_events(path: str | Path) -> list[dict] | None:
+    """Event lines from the log, or ``None`` when the log cannot be read.
+
+    Same fail-loud contract as ``_load_feedback``: a report on an unreadable
+    log must error, never look like "no signals".
+    """
+    log = Path(path)
+    try:
+        with log.open("r", encoding="utf-8") as handle:
+            handle.read(1)
+    except OSError as exc:
+        print(f"error: cannot read log {log}: {exc}", file=sys.stderr)
+        return None
+    return QueryLog(log).event_records()
+
+
 def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Aggregate operator feedback votes into a triage report."
@@ -130,11 +198,40 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         dest="as_json",
         help="emit JSON instead of the plain-text table",
     )
+    parser.add_argument(
+        "--signals",
+        action="store_true",
+        help=(
+            "report decline-strong-pool events (detection view) instead of "
+            "feedback votes"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
+    if args.signals:
+        events = _load_events(args.log)
+        if events is None:
+            return 1
+        now = time.time()
+        rows = aggregate_signals(events, now=now, days=args.days, top=args.top)
+        if args.as_json:
+            print(
+                json.dumps(
+                    {
+                        "days": args.days,
+                        "top": args.top,
+                        "signals": rows,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(format_signals(rows, days=args.days, top=args.top))
+        return 0
     records = _load_feedback(args.log)
     if records is None:
         return 1

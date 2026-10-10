@@ -260,3 +260,67 @@ def test_feedback_write_failure_never_raises(tmp_path) -> None:
 
 def test_feedback_records_of_an_absent_log_is_empty(tmp_path) -> None:
     assert QueryLog(tmp_path / "absent.jsonl").feedback_records() == []
+
+
+# ---------------------------------------------------------------------------
+# decline-signal write path (roadmap item 4, phase 1: detection only)
+# ---------------------------------------------------------------------------
+
+
+def _decline_hits() -> tuple:
+    """A full page-diverse pool, the shape a strong-pool decline sees."""
+    from plant_rag.models import Hit
+
+    return tuple(
+        Hit(manual_id="Owners_Manual", page=page, revision="r3", child="c", parent="p")
+        for page in (98, 99, 205, 206, 294)
+    )
+
+
+def test_decline_signal_round_trips_with_its_pool(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    log = QueryLog(path)
+    log.record(
+        build_record(
+            "como configuro el limite de velocidad",
+            _answer("refusal", ()),
+            2.0,
+            model="m",
+        )
+    )
+
+    log.record_decline_signal(
+        "como configuro el limite de velocidad", _decline_hits(), model="m"
+    )
+
+    events = log.event_records("decline-strong-pool")
+    assert len(events) == 1
+    assert events[0]["question"] == "como configuro el limite de velocidad"
+    assert events[0]["pool_size"] == 5
+    assert events[0]["pages"] == [98, 99, 205, 206, 294]
+    assert events[0]["manual_id"] == "Owners_Manual"
+    assert events[0]["revision"] == "r3"
+
+    # Three schemas, one file, zero bleed: stats see the answer only.
+    assert len(log.records()) == 1
+    assert log.feedback_records() == []
+
+
+def test_event_records_can_list_every_event_type(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    log = QueryLog(path)
+    log.record_feedback("q1", "answer", "down", model="m")
+    log.record_decline_signal("q2", _decline_hits(), model="m")
+
+    kinds = sorted(event["event"] for event in log.event_records())
+
+    assert kinds == ["decline-strong-pool", "feedback"]
+
+
+def test_decline_signal_write_failure_never_raises(tmp_path) -> None:
+    # Detection must never block or break an answer: same best-effort rule.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    log = QueryLog(blocker / "nested" / "queries.jsonl")
+
+    log.record_decline_signal("q", _decline_hits(), model="m")  # no raise
