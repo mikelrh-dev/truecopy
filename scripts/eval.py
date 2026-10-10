@@ -31,6 +31,12 @@ Calibration (MIN_SCORE):
     version summed them, which hid both classes), and leaves the default
     untouched - it does NOT silently change it.
 
+    With ``--record``, a fully passing eval also appends the sweep as ONE
+    calibration record to ``config.CALIBRATION_PATH`` (append-only JSONL,
+    read later by the ingest CLI's advisory). Recording is silent,
+    best-effort, and never changes config.MIN_SCORE or the exit code;
+    ``--record`` and ``--no-calibration`` are mutually exclusive.
+
 Exit codes:
     0 - all four mandatory checks pass.
     1 - any mandatory check fails, or the stack is unreachable, or calibration
@@ -57,6 +63,7 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from plant_rag import config
+from plant_rag.calibration import append_record, build_record
 from plant_rag.models import Answer, REFUSAL_ES
 from plant_rag.scheduling.scheduler import Scheduler
 from plant_rag.retrieve.embedder import get_embedder
@@ -116,6 +123,10 @@ class EvalResult:
     passed: bool
     latency_s: float
     detail: str
+    # Golden grounding counts, carried for the calibration record only;
+    # the default None keeps every other check byte-identical on __str__.
+    golden_pass: int | None = None
+    golden_total: int | None = None
 
     def __str__(self) -> str:
         status = "PASS" if self.passed else "FAIL"
@@ -611,6 +622,10 @@ def check_golden_grounding(
         passed=passed,
         latency_s=_now_s() - t0,
         detail=detail or "no golden queries recorded",
+        # Counts travel only on the passing shape: a failed check records
+        # None, which the calibration record renders as "golden n/d".
+        golden_pass=len(successes) if passed else None,
+        golden_total=len(successes) + len(failures) if passed else None,
     )
 
 
@@ -789,6 +804,25 @@ def run_calibration(client: QdrantClient) -> CalibrationReport:
     )
 
 
+def _best_separating(report: CalibrationReport) -> CalibrationPoint | None:
+    """The HIGHEST threshold that keeps every in-corpus query above the floor
+    while every out-of-corpus query stays below it - looser floors only
+    weaken the refusal gate. None when nothing separates the two classes.
+
+    Shared by the printed report and the recorded v1 line, so the operator
+    and the store always see the same recommendation.
+    """
+    separating = [
+        point
+        for point in report.points
+        if point.in_corpus_hits == report.in_total
+        and point.out_of_corpus_hits == 0
+    ]
+    if not separating:
+        return None
+    return max(separating, key=lambda point: point.min_score)
+
+
 def report_calibration(report: CalibrationReport) -> str:
     """Report the sweep with both classes and a recommendation, changing nothing."""
     if not report.points:
@@ -808,19 +842,11 @@ def report_calibration(report: CalibrationReport) -> str:
             f"{point.out_of_corpus_hits:>4}/{report.out_total:<13}"
         )
 
-    # The recommendation is mechanical: the HIGHEST threshold that still
-    # keeps every in-corpus query above the floor while every out-of-corpus
-    # query stays below it - looser floors only weaken the refusal gate.
-    separating = [
-        point
-        for point in report.points
-        if point.in_corpus_hits == report.in_total
-        and point.out_of_corpus_hits == 0
-    ]
+    # The recommendation is mechanical (see _best_separating).
     lines.append("")
     lines.append(f"Current default: {config.MIN_SCORE}")
-    if separating:
-        best = max(separating, key=lambda point: point.min_score)
+    best = _best_separating(report)
+    if best is not None:
         lines.append(
             f"Recommendation: PLANT_RAG_MIN_SCORE={best.min_score:.2f} "
             f"(all {report.in_total} in-corpus queries above the floor, "
@@ -837,6 +863,57 @@ def report_calibration(report: CalibrationReport) -> str:
     return "\n".join(lines)
 
 
+def _append_calibration_record(
+    client: QdrantClient,
+    manual_id: str | None,
+    report: CalibrationReport,
+    golden_result: EvalResult | None,
+) -> bool:
+    """Append one v1 calibration record for this eval run; best-effort, silent.
+
+    Recording is NOT part of the exit-code contract: a failed write returns
+    False and the operator still gets the sweep report above. The recorded
+    hits come from the recommended floor, or - when nothing separates the
+    classes - from the swept floor closest to the current default, so the
+    line always reflects what was actually measured.
+    """
+    best = _best_separating(report)
+    if best is not None:
+        in_hits, out_hits = best.in_corpus_hits, best.out_of_corpus_hits
+        recommended = best.min_score
+    else:
+        nearest = min(
+            report.points,
+            key=lambda point: abs(point.min_score - config.MIN_SCORE),
+        )
+        in_hits, out_hits = nearest.in_corpus_hits, nearest.out_of_corpus_hits
+        recommended = None
+
+    revision_number = current_revision(client)
+    record = build_record(
+        manual_id or "unknown",
+        f"r{revision_number}" if revision_number is not None else "",
+        current_min_score=config.MIN_SCORE,
+        in_corpus_hits=in_hits,
+        in_total=report.in_total,
+        out_of_corpus_hits=out_hits,
+        out_total=report.out_total,
+        recommended_min_score=recommended,
+        golden_pass=golden_result.golden_pass if golden_result else None,
+        golden_total=golden_result.golden_total if golden_result else None,
+        golden_set_present=bool(manual_id) and golden_set_for(manual_id) is not None,
+        sweep=[
+            {
+                "threshold": point.min_score,
+                "in_hits": point.in_corpus_hits,
+                "out_hits": point.out_of_corpus_hits,
+            }
+            for point in report.points
+        ],
+    )
+    return append_record(config.CALIBRATION_PATH, record)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -846,10 +923,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Scripted evaluation set (answering spec A4) + MIN_SCORE calibration."
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--no-calibration",
         action="store_true",
         help="Skip the MIN_SCORE calibration sweep.",
+    )
+    mode.add_argument(
+        "--record",
+        action="store_true",
+        help=(
+            "After a fully passing eval, append the sweep as one calibration "
+            "record to config.CALIBRATION_PATH (silent, best-effort; never "
+            "changes config.MIN_SCORE or the exit code)."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -915,6 +1002,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Running MIN_SCORE calibration sweep...")
         report = run_calibration(client)
         print(report_calibration(report))
+        if args.record and all_passed and report.points:
+            golden_result = next(
+                (r for r in results if r.name == "golden grounding"), None
+            )
+            _append_calibration_record(client, manual_id, report, golden_result)
 
     print("-" * 60)
     return 0 if all_passed else 1

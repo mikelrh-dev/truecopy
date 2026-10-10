@@ -9,6 +9,7 @@ exercised by the runtime harness reported separately from this suite.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import fitz
@@ -525,3 +526,203 @@ def test_reindex_rejects_blank_manual_id(tmp_path) -> None:
     fake = FakeQdrant()
     with pytest.raises(ValueError, match="manual_id"):
         run_reindex(pdf, client=fake, encode=fake_encode, manual_id=" ")
+
+
+# --- Phase 4: read-only calibration advisory on the ingest CLI -------------
+
+
+def _seed_calibration_record(
+    cal_path,
+    *,
+    manual_id: str = "828D",
+    revision: str = "r3",
+    recommended: float | None = 0.4,
+    current: float = 0.4,
+    age_days: int = 1,
+) -> None:
+    from plant_rag.calibration import append_record, build_record
+
+    recorded_at = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat()
+    append_record(
+        cal_path,
+        build_record(
+            manual_id,
+            revision,
+            current_min_score=current,
+            in_corpus_hits=5,
+            in_total=5,
+            out_of_corpus_hits=0,
+            out_total=5,
+            recommended_min_score=recommended,
+            golden_pass=8,
+            golden_total=8,
+            golden_set_present=True,
+            sweep=[{"threshold": 0.4, "in_hits": 5, "out_hits": 0}],
+            recorded_at=recorded_at,
+        ),
+    )
+
+
+def _patch_ingest_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    cal_path: str,
+    *,
+    result_revision: str = "r3",
+) -> list[dict]:
+    """Hermetic ingest CLI: fake client/embedder, monkeypatched reindex.
+
+    Returns the list of reindex call records (manual_id etc.) so tests can
+    prove the advisory never replaced or re-triggered ingestion.
+    """
+    import scripts.ingest as ingest_cli
+    from plant_rag import config
+
+    monkeypatch.setattr(config, "CALIBRATION_PATH", cal_path)
+    monkeypatch.setattr(
+        config, "ANSWER_CACHE_PATH", str(tmp_path / "answer-cache.jsonl")
+    )
+
+    class _FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+    monkeypatch.setattr(ingest_cli, "QdrantClient", _FakeClient)
+
+    class _FakeEmbedder:
+        def encode(self, texts: list[str]) -> list[list[float]]:
+            return [[0.0] * 8 for _ in texts]
+
+    monkeypatch.setattr(ingest_cli, "get_embedder", lambda: _FakeEmbedder())
+
+    calls: list[dict] = []
+
+    def _fake_reindex(pdf_path, *, client, encode, manual_id, batch_pages):
+        calls.append({"manual_id": manual_id, "client": client})
+        return SimpleNamespace(
+            revision=result_revision,
+            text_points=10,
+            alarm_points=3,
+            previous_revision="r2",
+            stale_collections=[],
+        )
+
+    monkeypatch.setattr(ingest_cli, "run_reindex", _fake_reindex)
+    return calls
+
+
+def test_ingest_prints_fresh_advisory_after_the_summary(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import scripts.ingest as ingest_cli
+
+    cal_path = tmp_path / "calibration.jsonl"
+    _seed_calibration_record(cal_path)
+    _patch_ingest_harness(monkeypatch, tmp_path, str(cal_path))
+    pdf = make_pdf(tmp_path / "v.pdf", ["body"])
+
+    assert ingest_cli.main([str(pdf), "--manual-id", "828D"]) == 0
+
+    out = capsys.readouterr().out
+    assert "OK — revisión r3 en servicio:" in out  # the summary comes first
+    assert "Sugerencia de calibración [fresh]" in out
+    assert "separates this labeled set" in out
+    assert "(revisión r3)" in out
+    assert "borre" not in out  # floors match: no wipe instruction
+
+
+def test_ingest_no_record_prints_the_no_record_notice(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import scripts.ingest as ingest_cli
+
+    cal_path = tmp_path / "calibration.jsonl"  # exists, but no records
+    _patch_ingest_harness(monkeypatch, tmp_path, str(cal_path))
+    pdf = make_pdf(tmp_path / "v.pdf", ["body"])
+
+    assert ingest_cli.main([str(pdf), "--manual-id", "828D"]) == 0
+
+    out = capsys.readouterr().out
+    assert "No hay registro de calibración para '828D'" in out
+    assert "Sugerencia de calibración" not in out
+
+
+def test_ingest_stale_record_is_downgraded_not_hidden(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import scripts.ingest as ingest_cli
+
+    cal_path = tmp_path / "calibration.jsonl"
+    _seed_calibration_record(cal_path, age_days=100)  # >90d, same revision
+    _patch_ingest_harness(monkeypatch, tmp_path, str(cal_path))
+    pdf = make_pdf(tmp_path / "v.pdf", ["body"])
+
+    assert ingest_cli.main([str(pdf), "--manual-id", "828D"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Aviso [soft-stale]" in out
+    assert "separates this labeled set" in out  # downgraded, never hidden
+
+
+def test_ingest_hard_stale_when_the_stored_revision_differs(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The spec GIVEN end-to-end: a record stored under an older revision.
+
+    The seed below writes revision ``r2`` while the reindex lands ``r3``, so
+    the advisory must label the record hard-stale (revision mismatch) — not
+    the age-based soft-stale path — while still showing its content.
+    """
+    import scripts.ingest as ingest_cli
+
+    cal_path = tmp_path / "calibration.jsonl"
+    _seed_calibration_record(cal_path, revision="r2")
+    _patch_ingest_harness(monkeypatch, tmp_path, str(cal_path))
+    pdf = make_pdf(tmp_path / "v.pdf", ["body"])
+
+    assert ingest_cli.main([str(pdf), "--manual-id", "828D"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Aviso [hard-stale]" in out
+    assert "separates this labeled set" in out  # downgraded, never hidden
+    assert "golden 8/8" in out  # counts and date travel with the stale line
+
+
+def test_ingest_with_empty_path_prints_nothing_extra(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import scripts.ingest as ingest_cli
+
+    _patch_ingest_harness(monkeypatch, tmp_path, "")
+    pdf = make_pdf(tmp_path / "v.pdf", ["body"])
+
+    assert ingest_cli.main([str(pdf), "--manual-id", "828D"]) == 0
+
+    out = capsys.readouterr().out
+    assert "OK — revisión r3 en servicio:" in out
+    assert "Sugerencia" not in out
+    assert "Aviso" not in out
+    assert "No hay registro" not in out
+
+
+def test_ingest_advisory_never_mutates_config_or_the_store(
+    tmp_path, monkeypatch
+) -> None:
+    """Read-only contract: bytes, config, and cache all survive untouched."""
+    import scripts.ingest as ingest_cli
+    from plant_rag import config
+
+    cal_path = tmp_path / "calibration.jsonl"
+    _seed_calibration_record(cal_path)
+    calls = _patch_ingest_harness(monkeypatch, tmp_path, str(cal_path))
+    pdf = make_pdf(tmp_path / "v.pdf", ["body"])
+    before = cal_path.read_bytes()
+    min_score_before = config.MIN_SCORE
+
+    assert ingest_cli.main([str(pdf), "--manual-id", "828D"]) == 0
+
+    assert cal_path.read_bytes() == before  # the store is append-never-read-write
+    assert config.MIN_SCORE == min_score_before
+    assert not (tmp_path / "answer-cache.jsonl").exists()
+    assert calls == [{"manual_id": "828D", "client": calls[0]["client"]}]
+    assert len(calls) == 1  # exactly one reindex: the advisory adds none

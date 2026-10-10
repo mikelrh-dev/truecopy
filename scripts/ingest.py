@@ -15,6 +15,9 @@ What it does (ADR-001 blue/green):
     4. Upserts points, validates counts, swaps both ``current_*`` aliases
        atomically, deletes the previous revision.
     5. On failure: aliases untouched, previous revision keeps serving.
+    6. On success: prints a READ-ONLY calibration advisory for this
+       manual/revision when ``config.CALIBRATION_PATH`` carries one
+       (``plant_rag.calibration``) — a suggestion, never a config change.
 
 Exit codes:
     0 — ingestion succeeded.
@@ -34,6 +37,7 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from plant_rag import config
+from plant_rag.calibration import advisory
 from plant_rag.ingest.reindex import run_reindex
 from plant_rag.retrieve.embedder import get_embedder
 from qdrant_client import QdrantClient
@@ -94,6 +98,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  previous     = {result.previous_revision}")
     if result.stale_collections:
         print(f"  stale (no borraron): {', '.join(result.stale_collections)}")
+
+    # Read-only calibration advisory for THIS manual/revision: eval informs,
+    # the owner applies. It never mutates the index, config, or the store;
+    # an empty CALIBRATION_PATH prints nothing at all.
+    note = advisory(
+        config.CALIBRATION_PATH,
+        manual_id,
+        result.revision,
+        cache_path=config.ANSWER_CACHE_PATH,
+    )
+    if note is not None:
+        print(note)
 
     return 0
 

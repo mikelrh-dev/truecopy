@@ -130,3 +130,12 @@ if ANSWER_CACHE_MAX_ENTRIES < 1:
         f"{_ENV_PREFIX}ANSWER_CACHE_MAX_ENTRIES must be >= 1, "
         f"got {ANSWER_CACHE_MAX_ENTRIES}"
     )
+
+# --- Calibration -----------------------------------------------------------
+# Append-only JSONL of eval floor recommendations (one record per recorded
+# eval run), keyed by manual_id/revision. The ingest CLI prints a read-only
+# advisory from it after a reindex; the serving path NEVER reads it (records
+# never participate in threshold resolution — precedence stays env over
+# config default, enforced by an anti-import guard test). Set to "" to
+# disable recording and advisories entirely.
+CALIBRATION_PATH = _env_str("CALIBRATION_PATH", "logs/calibration.jsonl")

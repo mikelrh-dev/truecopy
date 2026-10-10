@@ -12,10 +12,12 @@ Conventions: English code, hermetic subprocesses (no Qdrant/Ollama required —
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -183,3 +185,225 @@ def test_query_cli_generate_passes_the_configured_answer_cache(
     query_cli._generate("hola", 10.0)
 
     assert seen["cache"] is sentinel
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: per-manual calibration records (--record on the eval CLI)
+# ---------------------------------------------------------------------------
+
+
+def _patch_eval_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    cal_path: Path | str,
+    *,
+    break_check: str | None = None,
+) -> object:
+    """Replace every live dependency of ``eval.main`` with hermetic fakes.
+
+    ``break_check`` names one of the four checks to fail, exercising the
+    "record only after ALL checks pass" gate. Returns the fixed report the
+    fake sweep hands back.
+    """
+    import scripts.eval as eval_cli
+    from scripts.eval import CalibrationPoint, CalibrationReport, EvalResult
+    from plant_rag import config
+
+    monkeypatch.setattr(
+        config, "CALIBRATION_PATH", str(cal_path) if cal_path else ""
+    )
+    monkeypatch.setattr(config, "MIN_SCORE", 0.40)
+
+    class _FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_collections(self):
+            return None
+
+    monkeypatch.setattr(eval_cli, "QdrantClient", _FakeClient)
+    monkeypatch.setattr(eval_cli, "_has_ollama", lambda: True)
+    monkeypatch.setattr(
+        eval_cli,
+        "current_manual_id",
+        lambda client: "828D_DA_1015_en_en_US",
+    )
+    monkeypatch.setattr(eval_cli, "current_revision", lambda client: 3)
+
+    def _result(name: str, passed: bool, **fields: object) -> EvalResult:
+        return EvalResult(
+            name=name, passed=passed, latency_s=0.0, detail="ok", **fields
+        )
+
+    checks = (
+        ("alarm", "check_alarm_known_and_unknown", "alarm retrieval"),
+        ("crosslingual", "check_crosslingual_es_en", "cross-lingual ES->EN"),
+        ("refusal", "check_refusal_out_of_corpus", "refusal"),
+        ("golden", "check_golden_grounding", "golden grounding"),
+    )
+    for key, attr, name in checks:
+        passed = break_check != key
+        fields: dict = {}
+        if key == "golden" and passed:
+            fields = {"golden_pass": 2, "golden_total": 2}
+        monkeypatch.setattr(
+            eval_cli,
+            attr,
+            lambda client, *a, _name=name, _passed=passed, _fields=fields: _result(
+                _name, _passed, **_fields
+            ),
+        )
+
+    report = CalibrationReport(
+        points=[
+            CalibrationPoint("threshold=0.30", 0.30, 5, 1),
+            CalibrationPoint("threshold=0.50", 0.50, 5, 0),
+            CalibrationPoint("threshold=0.60", 0.60, 4, 0),
+        ],
+        in_total=5,
+        out_total=5,
+    )
+    monkeypatch.setattr(eval_cli, "run_calibration", lambda client: report)
+    return report
+
+
+def test_eval_without_record_writes_no_file(tmp_path, monkeypatch) -> None:
+    """The default run keeps its old contract: no store, no side effects."""
+    import scripts.eval as eval_cli
+
+    cal_path = tmp_path / "calibration.jsonl"
+    _patch_eval_harness(monkeypatch, cal_path)
+
+    assert eval_cli.main([]) == 0
+    assert not cal_path.exists()
+
+
+def test_eval_record_appends_one_line_and_keeps_output_and_min_score(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """``--record`` appends exactly one v1 line, silently, after a pass."""
+    import scripts.eval as eval_cli
+    from plant_rag import config
+
+    cal_path = tmp_path / "nested" / "calibration.jsonl"  # also proves mkdir -p
+    _patch_eval_harness(monkeypatch, cal_path)
+
+    assert eval_cli.main(["--record"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Recommendation: PLANT_RAG_MIN_SCORE=0.50" in out  # report line stays
+    assert "Sugerencia de calibración" not in out  # recording adds no line
+    assert "Aviso [" not in out
+    assert config.MIN_SCORE == 0.40  # the sweep never rewrites the default
+
+    lines = cal_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["manual_id"] == "828D_DA_1015_en_en_US"
+    assert rec["revision"] == "r3"
+    assert rec["recommended_min_score"] == 0.5
+    assert rec["current_min_score"] == 0.4
+    assert (rec["in_corpus_hits"], rec["in_total"]) == (5, 5)
+    assert (rec["out_of_corpus_hits"], rec["out_total"]) == (0, 5)
+    assert rec["golden_pass"] == 2 and rec["golden_total"] == 2
+    assert rec["golden_set_present"] is True
+    assert rec["separates_labeled_set"] is True
+    assert rec["source"] == "eval"
+    assert "schema" not in rec  # v1 keys stay exactly the design set
+    assert rec["sweep"] == [
+        {"threshold": 0.3, "in_hits": 5, "out_hits": 1},
+        {"threshold": 0.5, "in_hits": 5, "out_hits": 0},
+        {"threshold": 0.6, "in_hits": 4, "out_hits": 0},
+    ]
+    assert rec["recorded_at"]
+
+
+def test_eval_record_conflicts_with_no_calibration_and_exits_two() -> None:
+    """The two modes are mutually exclusive: argparse rejects the combo."""
+    import scripts.eval as eval_cli
+
+    with pytest.raises(SystemExit) as excinfo:
+        eval_cli.main(["--record", "--no-calibration"])
+
+    assert excinfo.value.code == 2
+
+
+def test_eval_record_with_empty_path_is_silent_and_exit_unchanged(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """``CALIBRATION_PATH=""`` disables recording without any behavior change."""
+    import scripts.eval as eval_cli
+
+    _patch_eval_harness(monkeypatch, "")
+
+    assert eval_cli.main(["--record"]) == 0
+    assert list(tmp_path.iterdir()) == []  # nothing written anywhere
+    out = capsys.readouterr().out
+    assert "Recommendation: PLANT_RAG_MIN_SCORE=0.50" in out
+    assert "Sugerencia de calibración" not in out
+
+
+def test_eval_record_never_appends_when_any_check_fails(tmp_path, monkeypatch) -> None:
+    """A failing mandatory check keeps exit 1 AND skips the record."""
+    import scripts.eval as eval_cli
+
+    cal_path = tmp_path / "calibration.jsonl"
+    _patch_eval_harness(monkeypatch, cal_path, break_check="refusal")
+
+    assert eval_cli.main(["--record"]) == 1
+    assert not cal_path.exists()
+
+
+def test_check_golden_grounding_maps_real_pass_and_total_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production count wiring of ``check_golden_grounding``, not a fake.
+
+    Existing record tests inject the counts through a fake, which leaves the
+    real success/failure counting unproven. This test drives the actual
+    function: the passing shape carries both counts, the failing shape
+    carries ``None`` for both (rendered later as "golden n/d").
+    """
+    import scripts.eval as eval_cli
+    from plant_rag.models import Hit
+    from scripts.eval import GoldenCase, ManualGoldenSet
+
+    monkeypatch.setattr(
+        eval_cli, "current_target", lambda client, alias: "manual_r3_text"
+    )
+    monkeypatch.setattr(
+        eval_cli,
+        "get_embedder",
+        lambda: SimpleNamespace(encode=lambda texts: [[0.0] for _ in texts]),
+    )
+
+    golden_set = ManualGoldenSet(
+        manual_id="828D_DA_1015_en_en_US",
+        cases=(
+            GoldenCase("10730", frozenset({100})),
+            GoldenCase("presion neumaticos", frozenset({98})),
+        ),
+        expect_alarms=True,
+    )
+
+    def _hits(*pages: int) -> tuple[Hit, ...]:
+        return tuple(
+            Hit(manual_id="m", page=page, revision="r3", child="c", parent="p")
+            for page in pages
+        )
+
+    class _Client:
+        pass
+
+    # Every case lands on an expected page → passed=True with both counts.
+    monkeypatch.setattr(
+        eval_cli, "retrieve_and_rank", lambda client, query: _hits(100, 98)
+    )
+    passed = eval_cli.check_golden_grounding(_Client(), golden_set)
+    assert passed.passed is True
+    assert (passed.golden_pass, passed.golden_total) == (2, 2)
+
+    # One case misses its golden page → passed=False with None for both.
+    monkeypatch.setattr(eval_cli, "retrieve_and_rank", lambda client, query: _hits(100))
+    failed = eval_cli.check_golden_grounding(_Client(), golden_set)
+    assert failed.passed is False
+    assert failed.golden_pass is None and failed.golden_total is None
