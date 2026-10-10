@@ -33,6 +33,9 @@ users.json
 # Operator data (JSONL, local-only by design): query log + answer cache
 logs/
 
+# Extracted page figures (derived from the operator's PDFs, local-only by design)
+data/figures/
+
 # Third-party manual PDFs (weight + copyright: never versioned, never pushed)
 documentation/*.pdf
 
