@@ -1,6 +1,6 @@
 # ROADMAP — pending work
 
-Status date: 2026-10-10 · hermetic suite @ 362 green on this branch · horizon: the three
+Status date: 2026-10-10 · hermetic suite @ 373 green on this branch · horizon: the three
 items below. This file is the agent-facing index: what is left, what evidence a
 next step needs, and where it plugs in. Deep rationale lives in the archived SDD
 changes under `openspec/changes/archive/`.
@@ -27,27 +27,38 @@ into `logs/queries.jsonl` whenever the model declines while the pool was full
 Read it with `scripts/feedback_report.py --signals`. The signal follows the
 `log=` seam, so eval traffic never emits one (`tests/test_pipeline.py`).
 
-**What is missing:** ONE bounded, DIRECTED retry when the model declines with a
-full pool and budget to spare (reuse `CITATION_RETRY_MIN_BUDGET_S`).
+**Evaluated 2026-10-10 and REJECTED (phase 2 does not ship).** A directed
+retry was implemented (one bounded call that NAMES the top-ranked passage),
+covered hermetically, and trialled live; the measurement says no.
 
-**Hard constraint — the shape of the retry:** it must NAME the target
-passage ("read this excerpt; if it answers the question, answer from it"),
-because generic pressure caused a measured incident: nudging a model that had
-declined made it answer an out-of-corpus question (cooking pasta) from an
-unrelated page (the horn page) — see `answer/llm.py:208-214`. A directed retry
-can only ground on the named page, and the citation validator still guards it.
+- **Frequency:** 4 of 22 representative in-corpus questions declined next to a
+  full pool (~18%), so the event is not rare — the phase-1 gate was met.
+- **Conversion:** the retry fired 3 times and recovered **0** answers
+  (`outcome="declined"` ×3).
+- **Root cause is upstream, not the retry.** Spot-checks against the text
+  index: `donde esta la rueda de repuesto` was pointed at page 210 — which
+  DOES contain "spare tire" — and the model still declined (the model, not the
+  naming, is the bottleneck). `como cambio la rueda` was pointed at the
+  reranker's top-1 (page 73) while the answer lives on 106/210/207 — the
+  "pool is wrong" case. `como activo el limpiaparabrisas` had wiper pages
+  (217/218/327) in its pool yet took the citation-fumble path, which the
+  directed retry does not cover.
 
-**Evidence required before implementing:** event frequency from the
-`--signals` view plus operator confirmation. If declines-with-full-pool are
+The roadmap's own gate anticipated this: *"If declines-with-full-pool are
 rare or the pool is wrong, this stays unimplemented — detection costs nothing,
-a bad retry costs trust.
+a bad retry costs trust."* The pool is wrong for exactly these queries.
 
-**Touch points:** `answer/llm.py` (both decline paths, mirroring the existing
-one bounded retry), `config.py` (budget knob), tests in `test_answer.py`.
-Because it changes answering behavior: full SDD cycle.
+**Decision:** the retry code and tests were reverted; phase 1 detection stays.
+The real follow-up is **retrieval quality for wheel/jack/wiper-class
+questions** (why the text-branch pages 210/106/207 do not survive rerank into
+the top-1), not a second LLM call. That would be its own SDD change, measured
+against the same probe (`outputs/rag-probe/signal_probe.py`).
 
-**Done when:** conversion rate measured, contract unchanged (a violating retry
-collapses to the exact refusal), hermetic suite green, change archived.
+**Evidence artifacts (gitignored, this machine):**
+`outputs/rag-probe/signal-probe*.out`, `outputs/eval-r9*.log`.
+
+**Done when:** conversion rate measured (done — 0/3, negative), contract
+unchanged (the reverted tree keeps it).
 
 ## 2. Live eval 3/3 (carried as W3)
 
