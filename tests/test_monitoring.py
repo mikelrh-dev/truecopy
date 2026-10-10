@@ -89,3 +89,101 @@ def test_refusal_records_carry_no_pages(tmp_path) -> None:
     assert record.pages == ()
     assert record.manual_id == ""
     assert isinstance(record, QueryRecord)
+
+
+# ---------------------------------------------------------------------------
+# tolerant reads: answer history survives the introduction of feedback events
+# ---------------------------------------------------------------------------
+
+
+def _raw_answer_line(question: str, *, ts: float, kind: str = "answer") -> str:
+    """One pre-change answer line, in the exact shape the old writer emitted."""
+    return json.dumps(
+        {
+            "ts": ts,
+            "question": question,
+            "kind": kind,
+            "latency_s": 1.5,
+            "pages": [98],
+            "manual_id": "Owners_Manual",
+            "revision": "",
+            "model": "m",
+        }
+    )
+
+
+def _raw_feedback_line(question: str, *, ts: float, vote: str = "up") -> str:
+    """One vote line as the (future) feedback writer will emit it."""
+    return json.dumps(
+        {
+            "event": "feedback",
+            "ts": ts,
+            "question": question,
+            "kind": "answer",
+            "vote": vote,
+            "model": "m",
+        }
+    )
+
+
+def test_pre_change_answer_lines_read_back_unchanged(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    path.write_text(
+        _raw_answer_line("presion neumaticos", ts=1000.0)
+        + "\n"
+        + _raw_answer_line("¿qué es el bypass?", ts=2000.0, kind="refusal")
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = QueryLog(path).records()
+
+    assert [r.question for r in records] == [
+        "presion neumaticos",
+        "¿qué es el bypass?",
+    ]
+    assert records[0].latency_s == 1.5
+    assert list(records[0].pages) == [98]
+    assert records[1].kind == "refusal"
+
+
+def test_mixed_log_returns_answer_lines_and_excludes_feedback(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                _raw_answer_line("primera pregunta", ts=1000.0),
+                _raw_feedback_line("primera pregunta", ts=1500.0, vote="up"),
+                _raw_answer_line("segunda pregunta", ts=2000.0),
+                _raw_feedback_line("segunda pregunta", ts=2500.0, vote="down"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = QueryLog(path).records()
+
+    assert [r.question for r in records] == ["primera pregunta", "segunda pregunta"]
+
+
+def test_stats_count_answers_only_in_a_mixed_log(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                _raw_answer_line("buena pregunta", ts=1000.0),
+                _raw_feedback_line("buena pregunta", ts=1500.0, vote="up"),
+                _raw_answer_line("mala pregunta", ts=2000.0, kind="refusal"),
+                _raw_feedback_line("mala pregunta", ts=2500.0, vote="down"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = stats(QueryLog(path).records())
+
+    assert result["total"] == 2
+    assert result["by_kind"] == {"answer": 1, "refusal": 1}
+    assert result["success_rate"] == 0.5

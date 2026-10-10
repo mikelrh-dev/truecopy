@@ -94,6 +94,13 @@ class QueryLog:
                         continue
                     try:
                         data = json.loads(line)
+                        if isinstance(data, dict) and data.get("event") == "feedback":
+                            # Feedback events are a DIFFERENT schema. Branch on
+                            # the event BEFORE any _FIELDS access so a vote line
+                            # is excluded by construction, never misread as a
+                            # corrupt answer (operator-feedback spec: "Feedback
+                            # records MUST NOT count toward answer stats").
+                            continue
                         parsed.append(QueryRecord(**{k: data[k] for k in _FIELDS}))
                     except Exception:  # noqa: BLE001 - skip corrupt lines
                         continue
