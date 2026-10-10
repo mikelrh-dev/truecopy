@@ -26,7 +26,7 @@ Esto tarda un rato (torch CPU + sentence-transformers + bge-reranker-m3).
 .\.venv\Scripts\python -m pytest tests -q
 ```
 
-Éxito esperado: `339 passed`. Si falla aquí, el entorno está mal: no sigas.
+Éxito esperado: `355 passed`. Si falla aquí, el entorno está mal: no sigas.
 
 ## Paso 1 — Levantar la infraestructura
 

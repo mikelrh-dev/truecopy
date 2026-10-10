@@ -98,7 +98,7 @@ src/plant_rag/
   calibration.py       registros de suelo por manual (eval informa, owner aplica)
 web/                   app.py (UI + scheduler compartido), auth.py, ui_es.py
 scripts/               ingest, reindex, query, run_web, eval, feedback_report
-tests/                 339 tests, todos herméticos (sin Qdrant ni Ollama)
+tests/                 355 tests, todos herméticos (sin Qdrant ni Ollama)
 raíz                   README (operación), TUTORIAL (puesta en marcha),
                        COMO-DECLINE-EL-SISTEMA (seguridad), ROADMAP (pendientes),
                        este documento
