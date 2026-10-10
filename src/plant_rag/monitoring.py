@@ -15,6 +15,10 @@ Conventions established here:
 * ``answer_question`` logs only when a caller passes a ``QueryLog`` — the
   web and CLI entrypoints do; the eval does not, because harness traffic is
   not operator traffic.
+* The same file doubles as the feedback store: votes are appended as
+  ``{"event": "feedback"}`` lines under the SAME lock. A second file would
+  split one history in two, and every reader already tolerates the event
+  schema (``records()`` branches on it before any field access).
 """
 
 from __future__ import annotations
@@ -40,6 +44,14 @@ _FIELDS = (
     "model",
 )
 
+_FEEDBACK_FIELDS = (
+    "ts",
+    "question",
+    "kind",
+    "vote",
+    "model",
+)
+
 
 @dataclass(frozen=True)
 class QueryRecord:
@@ -56,6 +68,28 @@ class QueryRecord:
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
+
+
+@dataclass(frozen=True)
+class FeedbackRecord:
+    """One operator vote — a feedback event, never an answer record.
+
+    Same log, same lock, different schema: ``kind`` records what was rated
+    (``answer``/``refusal``), ``vote`` is the rating itself, and no voter
+    identity exists anywhere (log convention: facts about answers, never
+    who typed them).
+    """
+
+    ts: float
+    question: str
+    kind: str
+    vote: str
+    model: str
+
+    def to_json(self) -> str:
+        payload = asdict(self)
+        payload["event"] = "feedback"
+        return json.dumps(payload, ensure_ascii=False)
 
 
 class QueryLog:
@@ -102,6 +136,58 @@ class QueryLog:
                             # records MUST NOT count toward answer stats").
                             continue
                         parsed.append(QueryRecord(**{k: data[k] for k in _FIELDS}))
+                    except Exception:  # noqa: BLE001 - skip corrupt lines
+                        continue
+        except Exception:  # noqa: BLE001 - an unreadable log reads as empty
+            return []
+        return parsed
+
+    def record_feedback(
+        self, question: str, kind: str, vote: str, *, model: str
+    ) -> None:
+        """Append one vote event under the same lock as the answer records.
+
+        Validation raises (a programming error must never be swallowed);
+        the write itself is best-effort, exactly like ``record``: a failed
+        vote must not block or break the operator.
+        """
+        if vote not in ("up", "down"):
+            raise ValueError(f"vote must be 'up' or 'down', got {vote!r}")
+        record = FeedbackRecord(
+            ts=time.time(),
+            question=question,
+            kind=kind,
+            vote=vote,
+            model=model,
+        )
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock, self.path.open("a", encoding="utf-8") as handle:
+                handle.write(record.to_json() + "\n")
+        except Exception:  # noqa: BLE001 - a failed vote write never blocks
+            pass
+
+    def feedback_records(self) -> list[FeedbackRecord]:
+        """Every parseable vote line; answer lines and corruption are skipped."""
+        if not self.path.is_file():
+            return []
+        parsed: list[FeedbackRecord] = []
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        if not (
+                            isinstance(data, dict)
+                            and data.get("event") == "feedback"
+                        ):
+                            continue  # answers belong to records(), not here
+                        parsed.append(
+                            FeedbackRecord(**{k: data[k] for k in _FEEDBACK_FIELDS})
+                        )
                     except Exception:  # noqa: BLE001 - skip corrupt lines
                         continue
         except Exception:  # noqa: BLE001 - an unreadable log reads as empty

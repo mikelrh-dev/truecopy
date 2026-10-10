@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from plant_rag.models import Answer, Citation
 from plant_rag.monitoring import QueryLog, QueryRecord, build_record, stats
 
@@ -187,3 +189,74 @@ def test_stats_count_answers_only_in_a_mixed_log(tmp_path) -> None:
     assert result["total"] == 2
     assert result["by_kind"] == {"answer": 1, "refusal": 1}
     assert result["success_rate"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# feedback write path: votes are appended, read back, and never leak
+# ---------------------------------------------------------------------------
+
+
+def test_feedback_vote_round_trips_alongside_the_answer_it_rates(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    log = QueryLog(path)
+    log.record(
+        build_record("presion neumaticos", _answer("answer", (("M", 98),)), 1.2, model="m")
+    )
+
+    log.record_feedback(
+        "presion neumaticos", "answer", "up", model="qwen2.5:7b-instruct"
+    )
+
+    votes = log.feedback_records()
+    assert len(votes) == 1
+    assert votes[0].question == "presion neumaticos"
+    assert votes[0].kind == "answer"
+    assert votes[0].vote == "up"
+    assert votes[0].model == "qwen2.5:7b-instruct"
+
+    # Same file, two readers, zero bleed: the vote is a feedback event line.
+    line = json.loads(path.read_text(encoding="utf-8").splitlines()[1])
+    assert line["event"] == "feedback"
+    assert len(log.records()) == 1
+    assert log.records()[0].question == "presion neumaticos"
+
+
+def test_feedback_records_skip_answer_lines_and_corruption(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    log = QueryLog(path)
+    log.record(build_record("respuesta", _answer("answer", (("M", 1),)), 1.0, model="m"))
+    log.record_feedback("mala respuesta", "refusal", "down", model="m")
+    path.write_text(
+        path.read_text(encoding="utf-8") + "{not json}\n", encoding="utf-8"
+    )
+
+    votes = log.feedback_records()
+
+    assert [v.question for v in votes] == ["mala respuesta"]
+    assert votes[0].vote == "down"
+    assert votes[0].kind == "refusal"
+
+
+def test_invalid_vote_is_rejected_and_never_written(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    log = QueryLog(path)
+
+    with pytest.raises(ValueError, match="vote"):
+        log.record_feedback("q", "answer", "sideways", model="m")
+
+    assert log.feedback_records() == []
+    assert not path.exists()
+
+
+def test_feedback_write_failure_never_raises(tmp_path) -> None:
+    # A failed vote must not block the operator: writing under a FILE
+    # raises at mkdir/open, and record_feedback must swallow it.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    log = QueryLog(blocker / "nested" / "queries.jsonl")
+
+    log.record_feedback("q", "answer", "down", model="m")  # no raise
+
+
+def test_feedback_records_of_an_absent_log_is_empty(tmp_path) -> None:
+    assert QueryLog(tmp_path / "absent.jsonl").feedback_records() == []
