@@ -20,6 +20,7 @@ exercised at function level with a fake upload widget value; the widget layer's
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -34,8 +35,13 @@ import plant_rag.ingest.reindex as reindex_mod
 import plant_rag.retrieve.embedder as embedder_mod
 import qdrant_client
 import web.app as webapp
+from plant_rag import config
+from plant_rag.models import REFUSAL_ES, Answer, Citation
 from web import auth
 from web.ui_es import (
+    FEEDBACK_DONE,
+    FEEDBACK_THUMBS_DOWN,
+    FEEDBACK_THUMBS_UP,
     LOGIN_CODE_LABEL,
     LOGIN_ERROR_GENERIC,
     LOGIN_PASSWORD_LABEL,
@@ -313,3 +319,118 @@ def test_owner_can_add_an_operator_code(store: auth.AuthStore) -> None:
 
     assert not at.exception
     assert store.has_user("op9")
+
+
+# ---------------------------------------------------------------------------
+# thumbs widget: one vote per shown answer (operator-feedback spec)
+# ---------------------------------------------------------------------------
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _seed_last_answer(at: AppTest, question: str, *, kind: str = "answer") -> AppTest:
+    citations = (Citation("Owners_Manual", 98),) if kind == "answer" else ()
+    at.session_state["last_answer"] = Answer(
+        kind=kind,
+        text_es="La presión de servicio es 2.4 bar." if kind == "answer" else "No aparece en la documentación",
+        citations=citations,
+    )
+    at.session_state["last_answer_question"] = question
+    at.run()
+    return at
+
+
+def test_vote_is_recorded_once_and_then_the_control_disables(
+    store: auth.AuthStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_path = tmp_path / "queries.jsonl"
+    monkeypatch.setattr(config, "QUERY_LOG_PATH", str(log_path))
+    at = _seed_last_answer(_login(store, "admin", "pw-owner"), "presion neumaticos")
+
+    assert not at.exception
+    assert FEEDBACK_THUMBS_UP in [b.label for b in at.button]
+    assert FEEDBACK_THUMBS_DOWN in [b.label for b in at.button]
+
+    next(b for b in at.button if b.label == FEEDBACK_THUMBS_UP).click()
+    at.run()
+
+    assert not at.exception
+    votes = _read_jsonl(log_path)
+    assert len(votes) == 1
+    assert votes[0]["event"] == "feedback"
+    assert votes[0]["vote"] == "up"
+    assert votes[0]["question"] == "presion neumaticos"
+    assert votes[0]["kind"] == "answer"
+    # Confirmation replaces the control: no second vote is possible.
+    assert FEEDBACK_DONE in [c.value for c in at.caption]
+    assert FEEDBACK_THUMBS_UP not in [b.label for b in at.button]
+    assert FEEDBACK_THUMBS_DOWN not in [b.label for b in at.button]
+
+    at.run()  # a rerun alone never records a second vote
+    assert len(_read_jsonl(log_path)) == 1
+
+
+def test_a_timeout_notice_is_not_rateable(
+    store: auth.AuthStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_path = tmp_path / "queries.jsonl"
+    monkeypatch.setattr(config, "QUERY_LOG_PATH", str(log_path))
+    at = _seed_last_answer(
+        _login(store, "admin", "pw-owner"), "consulta lenta", kind="timeout"
+    )
+
+    assert not at.exception
+    labels = [b.label for b in at.button]
+    assert FEEDBACK_THUMBS_UP not in labels
+    assert FEEDBACK_THUMBS_DOWN not in labels
+    assert FEEDBACK_DONE not in [c.value for c in at.caption]
+    assert _read_jsonl(log_path) == []
+
+
+def test_a_new_question_resets_the_rating_state(
+    store: auth.AuthStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plant_rag.answer import pipeline as pipeline_mod
+
+    log_path = tmp_path / "queries.jsonl"
+    monkeypatch.setattr(config, "QUERY_LOG_PATH", str(log_path))
+    at = _seed_last_answer(_login(store, "admin", "pw-owner"), "presion neumaticos")
+
+    next(b for b in at.button if b.label == FEEDBACK_THUMBS_UP).click()
+    at.run()
+    assert len(_read_jsonl(log_path)) == 1
+
+    # Ask a NEW question: the chain runs through the shared pipeline seam,
+    # stubbed here so the suite stays hermetic (no Qdrant, no Ollama).
+    monkeypatch.setattr(
+        pipeline_mod,
+        "answer_question",
+        lambda question, remaining_s, **kw: Answer(
+            kind="refusal", text_es=REFUSAL_ES, citations=()
+        ),
+    )
+    at.text_area(key="question_input").set_value("¿qué es el bypass?")
+    at.button(key="ask_btn").click()
+    at.run()
+
+    assert not at.exception
+    # The reset worked: this new rateable answer offers the control again.
+    assert FEEDBACK_THUMBS_UP in [b.label for b in at.button]
+    assert len(_read_jsonl(log_path)) == 1  # still only the first vote
+
+    next(b for b in at.button if b.label == FEEDBACK_THUMBS_UP).click()
+    at.run()
+
+    assert not at.exception
+    votes = _read_jsonl(log_path)
+    assert len(votes) == 2  # a new answer accepts its own vote
+    assert votes[1]["question"] == "¿qué es el bypass?"
+    assert votes[1]["kind"] == "refusal"

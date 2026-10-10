@@ -88,6 +88,10 @@ from web.ui_es import (
     ANSWER_LABEL,
     ANSWER_TIMEOUT_LABEL,
     ANSWER_TIMEOUT_PROMPT,
+    FEEDBACK_DONE,
+    FEEDBACK_LABEL,
+    FEEDBACK_THUMBS_DOWN,
+    FEEDBACK_THUMBS_UP,
 )
 
 # ---------------------------------------------------------------------------
@@ -472,6 +476,12 @@ def _page_question() -> None:
             return
         _mark_busy(st.session_state)
         st.session_state["last_answer"] = None
+        # A new question starts a new rating cycle: the previous answer's
+        # vote state (and the question it belongs to) must not leak onto
+        # the next rateable answer (operator-feedback spec: "asking a new
+        # question resets that state").
+        st.session_state["last_answer_voted"] = False
+        st.session_state.pop("last_answer_question", None)
 
         try:
             answer = _run_question(scheduler, question, store)
@@ -486,8 +496,11 @@ def _page_question() -> None:
 
         if answer is not None:
             st.session_state["last_answer"] = answer
+            st.session_state["last_answer_question"] = question
 
-    _render_answer(st.session_state.get("last_answer"))
+    last_answer = st.session_state.get("last_answer")
+    _render_answer(last_answer)
+    _feedback_widget(last_answer)
 
 
 # "In progress" is a TIMESTAMP, not a boolean. A boolean gets stuck when a
@@ -740,6 +753,60 @@ def _render_answer(answer: Answer | None) -> None:
                     f"{ANSWER_EXCERPT_LABEL} {citation.page}", expanded=False
                 ):
                     st.text(excerpt[:2000])
+
+
+def _feedback_widget(answer: Answer | None) -> None:
+    """Thumbs rating for the last rateable answer (operator-feedback spec).
+
+    Called from ``_page_question``, NEVER from ``_render_answer``: the
+    render stays a pure display of what the pipeline produced, while the
+    rating control is page state (session flag, vote recording). Only
+    grounded answers and refusals are rateable — a timeout notice has
+    nothing to rate (spec assumption A1).
+    """
+    if answer is None or answer.kind not in ("answer", "refusal"):
+        return
+    if st.session_state.get("last_answer_voted"):
+        st.caption(FEEDBACK_DONE)
+        return
+    st.caption(FEEDBACK_LABEL)
+    # on_click, not "if pressed": Streamlit runs the callback BEFORE the
+    # rerun renders, so the confirmation replaces the control in the very
+    # run where the operator clicked (a vote is recorded, then disabled).
+    left, right = st.columns(2)
+    with left:
+        st.button(
+            FEEDBACK_THUMBS_UP,
+            key="feedback_thumbs_up",
+            on_click=_cast_feedback,
+            args=(answer, "up"),
+        )
+    with right:
+        st.button(
+            FEEDBACK_THUMBS_DOWN,
+            key="feedback_thumbs_down",
+            on_click=_cast_feedback,
+            args=(answer, "down"),
+        )
+
+
+def _cast_feedback(answer: Answer, vote: str) -> None:
+    """Record one vote best-effort, then disable the control for this answer.
+
+    The write path is best-effort by contract (``record_feedback`` swallows
+    its own IO failures): a full disk must never block the operator. The
+    session flag flips regardless, so one shown answer accepts exactly one
+    vote even when the write failed.
+    """
+    log = _query_log()
+    if log is not None:
+        log.record_feedback(
+            st.session_state.get("last_answer_question", ""),
+            answer.kind,
+            vote,
+            model=config.OLLAMA_MODEL,
+        )
+    st.session_state["last_answer_voted"] = True
 
 
 # ---------------------------------------------------------------------------
