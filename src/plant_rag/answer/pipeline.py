@@ -31,6 +31,10 @@ Conventions established here (apply to every entrypoint):
   tests monkeypatch the seam they exercise instead of standing up models.
   ``retrieve_pool`` is public for the eval, which re-derives the exact pool
   an answer grounded on when it validates citations.
+* Two OPTIONAL per-call seams mirror each other: ``log`` (record the
+  answer) and ``cache`` (revision-scoped answer cache). Both default to
+  ``None`` — the eval harness passes neither, so harness traffic never
+  reads or writes operator state.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ import time
 from qdrant_client import QdrantClient
 
 from plant_rag import config
+from plant_rag.answer.cache import AnswerCache
 from plant_rag.answer.llm import Transport, generate as llm_generate
 from plant_rag.models import REFUSAL_ES, Answer, Citation, Hit
 from plant_rag.monitoring import QueryLog, build_record
@@ -49,6 +54,7 @@ from plant_rag.retrieve.expand import expand_query, keyword_variant
 from plant_rag.retrieve.fastpath import AlarmHit, lookup, lookup_code
 from plant_rag.retrieve.hybrid import hybrid_search
 from plant_rag.retrieve.rerank import rerank
+from plant_rag.retrieve.store import current_revision
 
 # 4-6 digits surrounded by word boundaries: the same shape rule as the fast
 # path, applied to WHOLE questions so "¿qué significa la alarma 1192?" can
@@ -171,6 +177,7 @@ def answer_question(
     client: QdrantClient | None = None,
     transport: Transport | None = None,
     log: QueryLog | None = None,
+    cache: AnswerCache | None = None,
 ) -> Answer:
     """Answer one operator question, recording it when a log is provided.
 
@@ -186,18 +193,64 @@ def answer_question(
             default) logs nothing — the web and CLI entrypoints pass their
             log; the eval passes none, because harness traffic is not
             operator traffic.
+        cache: Revision-scoped answer cache: consulted BEFORE the chain and
+            stored into AFTER a miss. ``None`` (the default) reads and
+            writes nothing — the eval passes none, because harness traffic
+            must never see the operator cache.
 
     Returns:
-        A grounded ``Answer``, the exact refusal, or ``DeadlineExceeded``
-        from generation - never a partial or invented reply.
+        A grounded ``Answer``, the exact refusal, the cached twin of
+        either, or ``DeadlineExceeded`` from generation - never a partial
+        or invented reply.
 
     Raises:
         ValueError: if ``question`` is blank.
     """
+    # Gate 0: blank question -> ValueError (a programming error, not an
+    # answer), BEFORE any cache lookup so a blank never keys an entry.
+    if not question.strip():
+        raise ValueError("question must not be empty")
+
     started = time.monotonic()
-    answer = _answer_question(
-        question, remaining_s, client=client, transport=transport
-    )
+    qdrant = client
+
+    if cache is not None:
+        # ONE client for lookup, chain, and re-check. The key needs the
+        # current revision (a reindex or model swap invalidates by
+        # construction): read once here, re-read only after a miss.
+        if qdrant is None:
+            qdrant = QdrantClient(url=config.QDRANT_URL, timeout=10)
+        revision = current_revision(qdrant)
+        cached = cache.lookup(revision, config.OLLAMA_MODEL, question)
+        if cached is not None:
+            # Hit: the stored answer verbatim (citations, refusal text,
+            # baked-in safety warning), logged with its REAL near-zero
+            # latency — no `cached` field exists in the log contract.
+            if log is not None:
+                log.record(
+                    build_record(
+                        question,
+                        cached,
+                        time.monotonic() - started,
+                        model=config.OLLAMA_MODEL,
+                    )
+                )
+            return cached
+
+    # Miss (or no cache): the full chain. Timeouts and LLM errors
+    # propagate here, BEFORE any store, so they can never be cached.
+    answer = _answer_question(question, remaining_s, client=qdrant, transport=transport)
+
+    if cache is not None:
+        # Store only if the corpus did not move under the chain's feet
+        # (the re-check runs on the miss path only). A store failure must
+        # never surface: the answer is already built and is still served.
+        try:
+            if current_revision(qdrant) == revision:
+                cache.store(revision, config.OLLAMA_MODEL, question, answer)
+        except Exception:  # noqa: BLE001 - the cache never breaks an answer
+            pass
+
     if log is not None:
         log.record(
             build_record(
@@ -217,9 +270,8 @@ def _answer_question(
     client: QdrantClient | None,
     transport: Transport | None,
 ) -> Answer:
-    if not question.strip():
-        raise ValueError("question must not be empty")
-
+    # The blank-question gate lives in ``answer_question`` (before any cache
+    # lookup); this private chain assumes a non-blank question.
     qdrant = (
         client if client is not None else QdrantClient(url=config.QDRANT_URL, timeout=10)
     )

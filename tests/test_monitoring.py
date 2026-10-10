@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from plant_rag.models import Answer, Citation
 from plant_rag.monitoring import QueryLog, QueryRecord, build_record, stats
 
@@ -89,3 +91,172 @@ def test_refusal_records_carry_no_pages(tmp_path) -> None:
     assert record.pages == ()
     assert record.manual_id == ""
     assert isinstance(record, QueryRecord)
+
+
+# ---------------------------------------------------------------------------
+# tolerant reads: answer history survives the introduction of feedback events
+# ---------------------------------------------------------------------------
+
+
+def _raw_answer_line(question: str, *, ts: float, kind: str = "answer") -> str:
+    """One pre-change answer line, in the exact shape the old writer emitted."""
+    return json.dumps(
+        {
+            "ts": ts,
+            "question": question,
+            "kind": kind,
+            "latency_s": 1.5,
+            "pages": [98],
+            "manual_id": "Owners_Manual",
+            "revision": "",
+            "model": "m",
+        }
+    )
+
+
+def _raw_feedback_line(question: str, *, ts: float, vote: str = "up") -> str:
+    """One vote line as the (future) feedback writer will emit it."""
+    return json.dumps(
+        {
+            "event": "feedback",
+            "ts": ts,
+            "question": question,
+            "kind": "answer",
+            "vote": vote,
+            "model": "m",
+        }
+    )
+
+
+def test_pre_change_answer_lines_read_back_unchanged(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    path.write_text(
+        _raw_answer_line("presion neumaticos", ts=1000.0)
+        + "\n"
+        + _raw_answer_line("¿qué es el bypass?", ts=2000.0, kind="refusal")
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = QueryLog(path).records()
+
+    assert [r.question for r in records] == [
+        "presion neumaticos",
+        "¿qué es el bypass?",
+    ]
+    assert records[0].latency_s == 1.5
+    assert list(records[0].pages) == [98]
+    assert records[1].kind == "refusal"
+
+
+def test_mixed_log_returns_answer_lines_and_excludes_feedback(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                _raw_answer_line("primera pregunta", ts=1000.0),
+                _raw_feedback_line("primera pregunta", ts=1500.0, vote="up"),
+                _raw_answer_line("segunda pregunta", ts=2000.0),
+                _raw_feedback_line("segunda pregunta", ts=2500.0, vote="down"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = QueryLog(path).records()
+
+    assert [r.question for r in records] == ["primera pregunta", "segunda pregunta"]
+
+
+def test_stats_count_answers_only_in_a_mixed_log(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                _raw_answer_line("buena pregunta", ts=1000.0),
+                _raw_feedback_line("buena pregunta", ts=1500.0, vote="up"),
+                _raw_answer_line("mala pregunta", ts=2000.0, kind="refusal"),
+                _raw_feedback_line("mala pregunta", ts=2500.0, vote="down"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = stats(QueryLog(path).records())
+
+    assert result["total"] == 2
+    assert result["by_kind"] == {"answer": 1, "refusal": 1}
+    assert result["success_rate"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# feedback write path: votes are appended, read back, and never leak
+# ---------------------------------------------------------------------------
+
+
+def test_feedback_vote_round_trips_alongside_the_answer_it_rates(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    log = QueryLog(path)
+    log.record(
+        build_record("presion neumaticos", _answer("answer", (("M", 98),)), 1.2, model="m")
+    )
+
+    log.record_feedback(
+        "presion neumaticos", "answer", "up", model="qwen2.5:7b-instruct"
+    )
+
+    votes = log.feedback_records()
+    assert len(votes) == 1
+    assert votes[0].question == "presion neumaticos"
+    assert votes[0].kind == "answer"
+    assert votes[0].vote == "up"
+    assert votes[0].model == "qwen2.5:7b-instruct"
+
+    # Same file, two readers, zero bleed: the vote is a feedback event line.
+    line = json.loads(path.read_text(encoding="utf-8").splitlines()[1])
+    assert line["event"] == "feedback"
+    assert len(log.records()) == 1
+    assert log.records()[0].question == "presion neumaticos"
+
+
+def test_feedback_records_skip_answer_lines_and_corruption(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    log = QueryLog(path)
+    log.record(build_record("respuesta", _answer("answer", (("M", 1),)), 1.0, model="m"))
+    log.record_feedback("mala respuesta", "refusal", "down", model="m")
+    path.write_text(
+        path.read_text(encoding="utf-8") + "{not json}\n", encoding="utf-8"
+    )
+
+    votes = log.feedback_records()
+
+    assert [v.question for v in votes] == ["mala respuesta"]
+    assert votes[0].vote == "down"
+    assert votes[0].kind == "refusal"
+
+
+def test_invalid_vote_is_rejected_and_never_written(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    log = QueryLog(path)
+
+    with pytest.raises(ValueError, match="vote"):
+        log.record_feedback("q", "answer", "sideways", model="m")
+
+    assert log.feedback_records() == []
+    assert not path.exists()
+
+
+def test_feedback_write_failure_never_raises(tmp_path) -> None:
+    # A failed vote must not block the operator: writing under a FILE
+    # raises at mkdir/open, and record_feedback must swallow it.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    log = QueryLog(blocker / "nested" / "queries.jsonl")
+
+    log.record_feedback("q", "answer", "down", model="m")  # no raise
+
+
+def test_feedback_records_of_an_absent_log_is_empty(tmp_path) -> None:
+    assert QueryLog(tmp_path / "absent.jsonl").feedback_records() == []
