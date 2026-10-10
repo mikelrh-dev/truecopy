@@ -1007,6 +1007,16 @@ def main(argv: list[str] | None = None) -> int:
                 (r for r in results if r.name == "golden grounding"), None
             )
             _append_calibration_record(client, manual_id, report, golden_result)
+        elif args.record:
+            # The owner asked for a record and got none: say why on stderr
+            # (stdout stays byte-identical to the pre-change eval output).
+            if not all_passed:
+                why = "hay checks en rojo"
+            elif not report.points:
+                why = "el barrido no produjo ningún punto (corpus vacío)"
+            else:
+                why = "CALIBRATION_PATH está desactivado"
+            print(f"nota: no se grabó registro de calibración ({why})", file=sys.stderr)
 
     print("-" * 60)
     return 0 if all_passed else 1

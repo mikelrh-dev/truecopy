@@ -353,6 +353,31 @@ def test_eval_record_never_appends_when_any_check_fails(tmp_path, monkeypatch) -
     assert not cal_path.exists()
 
 
+def test_eval_record_without_a_record_says_why_on_stderr(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The owner asked for a record and got none: stdout stays identical.
+
+    The reason travels on stderr (the eval's stdout is a frozen contract),
+    so a silent "nothing happened" can never look like a successful record.
+    """
+    import scripts.eval as eval_cli
+
+    # Baseline: the same failing run WITHOUT the flag.
+    _patch_eval_harness(monkeypatch, tmp_path / "a.jsonl", break_check="refusal")
+    assert eval_cli.main([]) == 1
+    without_record = capsys.readouterr().out
+
+    # Now with the flag: stdout must be byte-identical, the note on stderr.
+    _patch_eval_harness(monkeypatch, tmp_path / "b.jsonl", break_check="refusal")
+    assert eval_cli.main(["--record"]) == 1
+    captured = capsys.readouterr()
+
+    assert "no se grabó registro de calibración" in captured.err
+    assert "checks en rojo" in captured.err
+    assert captured.out == without_record
+
+
 def test_check_golden_grounding_maps_real_pass_and_total_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
