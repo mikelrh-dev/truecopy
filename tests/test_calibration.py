@@ -3,16 +3,20 @@
 Hermetic by contract: stdlib JSONL under ``tmp_path``, pure calls, no services.
 Covers the v1 record round-trip, append-only guarantee, latest-wins reads,
 corruption tolerance, the staleness matrix, the Spanish suggestion/advisory
-wording contract, and the dense-branch-only documentation scope.
+wording contract, the dense-branch-only documentation scope, and the
+``CALIBRATION_PATH`` config knob.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from plant_rag import calibration
+from plant_rag import config
 from plant_rag.calibration import (
     advisory,
     append_record,
@@ -389,3 +393,35 @@ def test_nothing_in_the_module_or_a_suggestion_is_called_optimal() -> None:
 
     assert "optimal" not in source.lower()
     assert "optimal" not in suggest(_build(), "fresh", cache_path=CACHE_PATH).lower()
+
+
+# --- Phase 2: config knob (CALIBRATION_PATH) -------------------------------
+
+
+def test_calibration_path_defaults_to_the_logs_store() -> None:
+    previous = os.environ.pop("PLANT_RAG_CALIBRATION_PATH", None)
+    try:
+        importlib.reload(config)
+        assert config.CALIBRATION_PATH == "logs/calibration.jsonl"
+    finally:
+        if previous is not None:
+            os.environ["PLANT_RAG_CALIBRATION_PATH"] = previous
+        importlib.reload(config)
+
+
+def test_calibration_path_env_override_and_empty_value_disables() -> None:
+    previous = os.environ.get("PLANT_RAG_CALIBRATION_PATH")
+    try:
+        os.environ["PLANT_RAG_CALIBRATION_PATH"] = "custom/cal.jsonl"
+        importlib.reload(config)
+        assert config.CALIBRATION_PATH == "custom/cal.jsonl"
+
+        os.environ["PLANT_RAG_CALIBRATION_PATH"] = ""
+        importlib.reload(config)
+        assert config.CALIBRATION_PATH == ""
+    finally:
+        if previous is None:
+            os.environ.pop("PLANT_RAG_CALIBRATION_PATH", None)
+        else:
+            os.environ["PLANT_RAG_CALIBRATION_PATH"] = previous
+        importlib.reload(config)
