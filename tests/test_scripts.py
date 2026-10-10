@@ -161,3 +161,25 @@ def test_query_cli_empty_semantic_result_returns_the_shared_refusal(
     assert answer.kind == "refusal"
     assert answer.text_es == REFUSAL_ES
     assert answer.citations == []
+
+
+def test_query_cli_generate_passes_the_configured_answer_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI is operator traffic: its generator wires the cache seam."""
+    import scripts.query as query_cli
+    from plant_rag.answer.cache import AnswerCache
+    from plant_rag.models import REFUSAL_ES
+
+    sentinel = object()
+    monkeypatch.setattr(AnswerCache, "from_config", lambda: sentinel)
+    seen: dict = {}
+
+    def _fake_answer(question, remaining_s, **kw):
+        seen.update(kw)
+        return Answer(kind="refusal", text_es=REFUSAL_ES, citations=())
+
+    monkeypatch.setattr(query_cli, "answer_question", _fake_answer)
+    query_cli._generate("hola", 10.0)
+
+    assert seen["cache"] is sentinel

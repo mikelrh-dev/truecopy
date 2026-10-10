@@ -547,7 +547,9 @@ def _generate_and_record(question: str, remaining_s: float) -> Answer:
     from plant_rag.answer.pipeline import answer_question
     from plant_rag.monitoring import QueryLog
 
-    answer = answer_question(question, remaining_s, log=_query_log())
+    answer = answer_question(
+        question, remaining_s, log=_query_log(), cache=_answer_cache()
+    )
     if len(_ANSWERS) > 1000:  # bounded: a console runs for days, not forever
         _ANSWERS.clear()
     _ANSWERS[question] = answer
@@ -567,6 +569,27 @@ def _query_log() -> "QueryLog | None":
         _QUERY_LOG_RESOLVED = True
         _QUERY_LOG = QueryLog.from_config()
     return _QUERY_LOG
+
+
+_ANSWER_CACHE: object = None
+_ANSWER_CACHE_RESOLVED = False
+
+
+def _answer_cache():
+    """The configured revision-scoped answer cache, resolved once per process.
+
+    One shared instance per server process (like ``_query_log``): the LRU
+    index stays warm across Streamlit reruns and concurrent sessions, so a
+    repeat question is served from memory while the JSONL file stays the
+    durable copy. ``None`` when the cache is disabled by configuration.
+    """
+    global _ANSWER_CACHE, _ANSWER_CACHE_RESOLVED
+    if not _ANSWER_CACHE_RESOLVED:
+        from plant_rag.answer.cache import AnswerCache
+
+        _ANSWER_CACHE_RESOLVED = True
+        _ANSWER_CACHE = AnswerCache.from_config()
+    return _ANSWER_CACHE
 
 
 def _cumulative_stats() -> dict | None:

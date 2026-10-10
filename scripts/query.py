@@ -32,6 +32,7 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 from plant_rag import config
 from plant_rag.models import Answer
 from plant_rag.scheduling.scheduler import Scheduler
+from plant_rag.answer.cache import AnswerCache
 from plant_rag.answer.pipeline import answer_question
 from plant_rag.answer.llm import LLMError
 from plant_rag.monitoring import QueryLog
@@ -53,8 +54,17 @@ def _answer_to_cli(answer: Answer) -> CliAnswer:
 
 
 def _generate(question: str, remaining_s: float) -> Answer:
-    """The shared chain (answer.pipeline): alarm fast path -> hybrid -> rerank -> LLM."""
-    return answer_question(question, remaining_s, log=QueryLog.from_config())
+    """The shared chain (answer.pipeline): alarm fast path -> hybrid -> rerank -> LLM.
+
+    Operator traffic, so it carries the operator's log AND the revision-
+    scoped answer cache (both disabled by configuration, never by the eval).
+    """
+    return answer_question(
+        question,
+        remaining_s,
+        log=QueryLog.from_config(),
+        cache=AnswerCache.from_config(),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

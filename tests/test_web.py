@@ -349,6 +349,25 @@ def test_clearing_the_flag_frees_the_ui() -> None:
     assert web_app._is_busy(state) is False
 
 
+def test_answer_cache_is_resolved_once_per_process_like_the_query_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plant_rag.answer.cache import AnswerCache
+    from web import app as web_app
+
+    calls: list[int] = []
+    fake = AnswerCache(tmp_path / "cache.jsonl")
+    monkeypatch.setattr(AnswerCache, "from_config", lambda: (calls.append(1) or fake))
+    monkeypatch.setattr(web_app, "_ANSWER_CACHE", None)
+    monkeypatch.setattr(web_app, "_ANSWER_CACHE_RESOLVED", False)
+
+    first = web_app._answer_cache()
+    second = web_app._answer_cache()
+
+    assert first is fake and second is fake
+    assert calls == [1]  # resolved once per process, reused afterwards
+
+
 class _FakeAlias:
     def __init__(self, alias_name: str, collection_name: str) -> None:
         self.alias_name = alias_name
