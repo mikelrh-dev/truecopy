@@ -314,7 +314,6 @@ def _do_reindex() -> None:
         client = QdrantClient(url=config.QDRANT_URL, timeout=60)
         encode = get_embedder().encode
         current = client.get_collections()
-        manual_id = "manual-actual"
 
         with st.status(OWNER_REINDEX_IN_PROGRESS, expanded=True) as status:
             status.write(OWNER_REINDEX_IN_PROGRESS)
