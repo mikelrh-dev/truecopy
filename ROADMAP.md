@@ -112,6 +112,42 @@ with explicit design decisions.
 gets the cited answer, and switching/replacing one manual leaves the others
 serving.
 
+## 4. Retrieval completeness on a two-page section (indicator lights)
+
+**Found 2026-10-10 (operator answer, live console on r10).** Asked
+*"¿Qué luces de testigo hay en el cuadro?"* the system answered citing **only
+page 15** (brake, brake-booster, ABS) and omitted every indicator light that
+lives on **page 16** (parking brake, tire pressure/TPMS, seat belt, airbag,
+position lights, low/high beam, adaptive headlights, stability control,
+Vehicle Hold, …). The manual's *Indicator Lights* section spans pages 15–16.
+
+**What was verified**
+- Page 16 **is indexed** (3092 chars) and its chunks carry the same
+  `[Indicator Lights]` prefix as page 15, so the content exists and is
+  retrievable in principle.
+- The model enumerated page 15's lights **completely** and none of page 16's →
+  the likely cause is **retrieval** (page 16 outside the top-5 the answer may
+  cite), not model brevity (the answer is short, far under `num_predict`).
+- **Eval weakness:** this question's golden expects `{15, 16}` but passes when
+  **either** page is retrieved (non-empty intersection), so the 4/4 run did
+  NOT catch that only page 15 reached the answer.
+
+**Not yet measured (blocked on RAM):** the live top-5 pool for this question
+(`retrieve_and_rank`) needs BGE-M3 (~2.5GB) and the dev machine was at <1GB
+free. "Page 16 fell outside the top-5" is a **strong inference, not a
+measurement**.
+
+**Next steps (tomorrow)**
+1. With RAM free, measure `retrieve_and_rank(client, "que luces de testigo hay
+   en el cuadro")` → is page 16 in the top-5?
+2. Fix the golden so it **requires both** pages (today it passes with one).
+3. If page 16 is missing, this is the **retrieval-quality** follow-up already
+   flagged for the wheel/jack/wiper questions — same class, same probe
+   (`outputs/rag-probe/signal_probe.py`).
+
+**Artifacts:** the PDF is now `documentacion/Owners_Manual.pdf`; corpus r10
+serves; figures live in `data/figures/r10/Owners_Manual/`.
+
 ## Housekeeping (optional)
 
 Operator credentials: the local `users.json` / `.streamlit-users.json` never
