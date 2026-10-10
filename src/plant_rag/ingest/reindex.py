@@ -16,6 +16,7 @@ pipeline itself.
 from __future__ import annotations
 
 import uuid
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,6 +138,20 @@ def _discard(client: QdrantClient, *names: str) -> None:
 def _point_id(key: str) -> str:
     """Deterministic point id so re-runs of one revision never duplicate."""
     return str(uuid.uuid5(_NAMESPACE, f"plant-rag:{key}"))
+
+
+def manual_id_from_filename(filename: str) -> str:
+    """The ingested ``manual_id`` for an upload: the PDF stem, sanitized.
+
+    ONE definition for every entrypoint (CLI ``ingest``/``reindex`` and the
+    web upload), so the same file always lands in the same identity
+    namespace: goldens, calibration records and citations all key on it.
+    The filesystem path never carries this identity (uploads are staged
+    under a UUID name for safety); only the manual's name does.
+    """
+    stem = Path(filename).stem
+    cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", stem).strip("_")
+    return cleaned or "manual-sin-nombre"
 
 
 def run_reindex(

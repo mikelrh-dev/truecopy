@@ -259,7 +259,7 @@ def _owner_upload() -> None:
 
 def _do_upload(uploaded) -> None:
     from plant_rag import config
-    from plant_rag.ingest.reindex import run_reindex
+    from plant_rag.ingest.reindex import manual_id_from_filename, run_reindex
     from plant_rag.retrieve.embedder import get_embedder
     from qdrant_client import QdrantClient
 
@@ -267,7 +267,11 @@ def _do_upload(uploaded) -> None:
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     encode = get_embedder().encode
-    manual_id = "manual-actual"
+    # The SAME identity namespace as the CLI: the manual's own filename.
+    # A single shared id for every web upload used to collide — goldens
+    # never matched and calibration records from different manuals
+    # overwrote each other (audit A1).
+    manual_id = manual_id_from_filename(uploaded.name)
 
     try:
         with st.status(OWNER_UPLOAD_IN_PROGRESS, expanded=True) as status:

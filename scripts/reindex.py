@@ -34,14 +34,10 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from plant_rag import config
-from plant_rag.ingest.reindex import run_reindex
+from plant_rag.calibration import advisory
+from plant_rag.ingest.reindex import manual_id_from_filename, run_reindex
 from plant_rag.retrieve.embedder import get_embedder
 from qdrant_client import QdrantClient
-
-
-def _manual_id_from_path(pdf_path: Path) -> str:
-    """Derive a stable manual identifier from the filename (no extension)."""
-    return pdf_path.stem.replace(" ", "_").replace("-", "_")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: replacement PDF not found: {pdf_path}", file=sys.stderr)
         return 1
 
-    manual_id = args.manual_id or _manual_id_from_path(pdf_path)
+    manual_id = args.manual_id or manual_id_from_filename(pdf_path.name)
 
     # Show what's currently serving before replacing it.
     try:
@@ -106,6 +102,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  previous     = {result.previous_revision}")
     if result.stale_collections:
         print(f"  stale (no borraron): {', '.join(result.stale_collections)}")
+
+    # Same read-only advisory as scripts/ingest.py: the calibration record
+    # for THIS manual (fresh, stale, or absent) so the owner sees the floor
+    # the eval measured before deciding whether to apply it. Eval informs,
+    # the owner applies.
+    note = advisory(
+        config.CALIBRATION_PATH,
+        manual_id,
+        result.revision,
+        cache_path=config.ANSWER_CACHE_PATH,
+    )
+    if note is not None:
+        print(note)
 
     return 0
 

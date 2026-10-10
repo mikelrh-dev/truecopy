@@ -726,3 +726,50 @@ def test_ingest_advisory_never_mutates_config_or_the_store(
     assert not (tmp_path / "answer-cache.jsonl").exists()
     assert calls == [{"manual_id": "828D", "client": calls[0]["client"]}]
     assert len(calls) == 1  # exactly one reindex: the advisory adds none
+
+
+def test_reindex_cli_prints_the_same_calibration_advisory(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The replacement CLI carries the same advisory as the first-load one.
+
+    Same contract as ``ingest.py``: one read-only Spanish line after the
+    summary, derived from the calibration record for this manual id.
+    """
+    import scripts.reindex as reindex_cli
+    from plant_rag.retrieve import store as store_mod
+
+    cal_path = tmp_path / "calibration.jsonl"
+    _seed_calibration_record(cal_path)
+    monkeypatch.setattr(config, "CALIBRATION_PATH", str(cal_path))
+    monkeypatch.setattr(
+        config, "ANSWER_CACHE_PATH", str(tmp_path / "answer-cache.jsonl")
+    )
+    monkeypatch.setattr(store_mod, "current_revision", lambda client: 2)
+
+    class _FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+    monkeypatch.setattr(reindex_cli, "QdrantClient", _FakeClient)
+    monkeypatch.setattr(
+        reindex_cli,
+        "get_embedder",
+        lambda: SimpleNamespace(encode=lambda texts: [[0.0] * 8 for _ in texts]),
+    )
+    monkeypatch.setattr(
+        reindex_cli,
+        "run_reindex",
+        lambda pdf, *, client, encode, manual_id, batch_pages: SimpleNamespace(
+            revision="r3", text_points=10, alarm_points=3, previous_revision="r2",
+            stale_collections=[],
+        ),
+    )
+    pdf = make_pdf(tmp_path / "v.pdf", ["body"])
+
+    assert reindex_cli.main([str(pdf), "--manual-id", "828D"]) == 0
+
+    out = capsys.readouterr().out
+    assert "OK — revisión r3 en servicio" in out  # the summary comes first
+    assert "Sugerencia de calibración [fresh]" in out
+    assert "separates this labeled set" in out
