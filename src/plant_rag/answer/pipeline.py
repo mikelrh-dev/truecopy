@@ -46,7 +46,7 @@ from qdrant_client import QdrantClient
 
 from plant_rag import config
 from plant_rag.answer.cache import AnswerCache
-from plant_rag.answer.llm import Transport, generate as llm_generate
+from plant_rag.answer.llm import DeclineSignal, Transport, generate as llm_generate
 from plant_rag.models import REFUSAL_ES, Answer, Citation, Hit
 from plant_rag.monitoring import QueryLog, build_record
 from plant_rag.retrieve.embedder import get_embedder
@@ -239,7 +239,19 @@ def answer_question(
 
     # Miss (or no cache): the full chain. Timeouts and LLM errors
     # propagate here, BEFORE any store, so they can never be cached.
-    answer = _answer_question(question, remaining_s, client=qdrant, transport=transport)
+    answer = _answer_question(
+        question,
+        remaining_s,
+        client=qdrant,
+        transport=transport,
+        decline_signal=(
+            None
+            if log is None
+            else lambda q, hits: log.record_decline_signal(
+                q, hits, model=config.OLLAMA_MODEL
+            )
+        ),
+    )
 
     if cache is not None:
         # Store only if the corpus did not move under the chain's feet
@@ -269,6 +281,7 @@ def _answer_question(
     *,
     client: QdrantClient | None,
     transport: Transport | None,
+    decline_signal: DeclineSignal | None = None,
 ) -> Answer:
     # The blank-question gate lives in ``answer_question`` (before any cache
     # lookup); this private chain assumes a non-blank question.
@@ -295,4 +308,6 @@ def _answer_question(
     options: dict = {"remaining_s": remaining_s}
     if transport is not None:
         options["transport"] = transport
+    if decline_signal is not None:
+        options["decline_signal"] = decline_signal
     return llm_generate(question, hits, **options)
