@@ -30,7 +30,7 @@ users.json
 # Operator upload staging (UUID-renamed PDFs waiting for ingestion)
 .uploads/
 
-# Operator query log (JSONL, local-only by design)
+# Operator data (JSONL, local-only by design): query log + answer cache
 logs/
 
 # Third-party manual PDFs (weight + copyright: never versioned, never pushed)

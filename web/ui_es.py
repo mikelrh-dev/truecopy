@@ -67,6 +67,15 @@ ANSWER_INFRA_ERROR_LABEL = "Error del servicio"
 ANSWER_INFRA_ERROR_PROMPT = "El servicio no está disponible en este momento. Vuelva a intentarlo más tarde."
 
 # ---------------------------------------------------------------------------
+# answer feedback (thumbs rating)
+# ---------------------------------------------------------------------------
+
+FEEDBACK_LABEL = "¿Fue útil esta respuesta?"
+FEEDBACK_THUMBS_UP = "Útil"
+FEEDBACK_THUMBS_DOWN = "No útil"
+FEEDBACK_DONE = "Gracias por su valoración."
+
+# ---------------------------------------------------------------------------
 # owner operations
 # ---------------------------------------------------------------------------
 
