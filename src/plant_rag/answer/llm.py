@@ -266,7 +266,11 @@ def generate(
             except DeadlineExceeded:
                 return Answer(kind="refusal", text_es=REFUSAL_ES, citations=())
             if _is_refusal_text(text):
-                # Second decline: the retry answer is also a refusal.
+                # Second decline: the retry answer is also a refusal. The
+                # pool is unchanged, so this is a decline-strong-pool event
+                # too - the model declined twice next to full evidence.
+                if decline_signal is not None and _full_pool(hits):
+                    decline_signal(question, hits)
                 return Answer(kind="refusal", text_es=REFUSAL_ES, citations=())
             try:
                 citations = validate_citations(text, hits)

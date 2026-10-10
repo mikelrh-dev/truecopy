@@ -477,6 +477,55 @@ def test_apply_safety_warning_only_touches_grounded_answers() -> None:
     assert apply_safety_warning(refusal, "peligro eléctrico") is refusal
 
 
+def test_a_second_decline_after_the_retry_also_signals_the_pool() -> None:
+    """Detection consistency: a decline after the citation retry is a decline.
+
+    The retry exists for citation fumbles; when the model declines AGAIN on
+    the retry, the pool has not changed, so the event must be recorded too -
+    otherwise exactly the "second chance and still declined" cases stay
+    invisible.
+    """
+    from plant_rag.answer.llm import generate
+
+    seen: list[tuple[str, int]] = []
+
+    class _FumbleThenDecline:
+        """First reply fumbles the marker (forcing the retry), then declines."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, url: str, payload: dict, timeout_s: float) -> dict:
+            self.calls += 1
+            # First reply TRIES to cite but with an unparseable marker, which
+            # is the only shape that earns the bounded retry.
+            content = (
+                "Dato con cita rota [Fuente: 828D sin página]"
+                if self.calls == 1
+                else "No aparece en la documentación"
+            )
+            return {"message": {"role": "assistant", "content": content}}
+
+    transport = _FumbleThenDecline()
+    hits = grounded_hits() + (
+        Hit(manual_id="828D", page=60, revision="r1", child="c", parent="p"),
+        Hit(manual_id="828D", page=61, revision="r1", child="c", parent="p"),
+        Hit(manual_id="828D", page=62, revision="r1", child="c", parent="p"),
+    )
+
+    answer = generate(
+        "pregunta",
+        hits,
+        remaining_s=60.0,
+        transport=transport,
+        decline_signal=lambda question, pool: seen.append((question, len(pool))),
+    )
+
+    assert answer.kind == "refusal"
+    assert transport.calls == 2  # the bounded retry did run
+    assert seen == [("pregunta", 5)]  # one signal, carrying the full pool
+
+
 def test_expired_budget_raises_deadline_without_calling_the_llm() -> None:
     transport = FakeTransport(outcome=VALID_ANSWER_ES)
 
