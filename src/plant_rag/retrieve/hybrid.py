@@ -12,9 +12,13 @@ Conventions established here:
   prefetches on it. An alias outside the ``manual_r{N}_text`` contract returns
   ``()`` instead of serving stray data.
 * The relevance floor is applied per-prefetch BEFORE fusion (Qdrant applies
-  ``score_threshold`` to each prefetch's own scores), so a Spanish question
-  with no English token overlap yields an empty fused list, which the caller
-  must turn into the exact refusal - never an empty prompt (ADR-004).
+  ``score_threshold`` to each prefetch's own scores) AND again at the POOL
+  level: the text branch is a recall AID on top of the calibrated dense
+  branch, never independent evidence, so if the dense branch has no
+  above-floor candidate the pool is empty even when the text branch matched.
+  A Spanish question with no English token overlap therefore yields an empty
+  fused list, which the caller must turn into the exact refusal - never an
+  empty prompt (ADR-004).
 * The text branch needs the payload index on ``child_text`` (case-insensitive
   word tokenizer, min token length 2). ``store.create_text_collection``
   creates it for every revision at ingest time (``store.text_index_params()``
@@ -116,6 +120,24 @@ def hybrid_search(
         ),
         limit=_PREFETCH_LIMIT,
     )
+
+    # Pool-level floor (fail closed): without an above-floor DENSE candidate
+    # nothing in the pool is dense-backed evidence. The text branch alone must
+    # not admit passages the calibrated floor already rejected, or a token-only
+    # coincidence could reach the prompt. One cheap probe call; the caller
+    # turns the empty pool into the exact refusal (ADR-004).
+    dense_probe = client.query_points(
+        collection_name=target,
+        query=[float(value) for value in query_vector],
+        limit=1,
+        query_filter=revision_filter(revision),
+        score_threshold=config.MIN_SCORE,
+        with_payload=False,
+        with_vectors=False,
+        timeout=10,
+    )
+    if not dense_probe.points:
+        return ()
 
     response = client.query_points(
         collection_name=target,

@@ -432,3 +432,50 @@ def test_check_golden_grounding_maps_real_pass_and_total_counts(
     failed = eval_cli.check_golden_grounding(_Client(), golden_set)
     assert failed.passed is False
     assert failed.golden_pass is None and failed.golden_total is None
+
+
+def test_run_calibration_probes_the_serving_pool_not_the_dense_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep must measure the path that answers operators (retrieve_pool)."""
+    import scripts.eval as eval_cli
+    from plant_rag import config
+
+    monkeypatch.setattr(
+        eval_cli, "current_target", lambda client, alias: "manual_r1_text"
+    )
+    monkeypatch.setattr(
+        eval_cli,
+        "get_embedder",
+        lambda: SimpleNamespace(encode=lambda texts: [[0.0] * 8 for _ in texts]),
+    )
+
+    english = (
+        "Coolant pressure switch behaviour under load. The service procedure "
+        "for the operator to follow is described in that chapter. Always "
+        "verify the coolant level before starting the machine and record "
+        "every reading in the maintenance log."
+    )
+
+    class _Client:
+        def scroll(self, **kwargs):
+            return [SimpleNamespace(payload={"parent_text": english})], None
+
+    calls = {"n": 0}
+
+    def fake_pool(client, question, vector):
+        calls["n"] += 1
+        return (object(),) if config.MIN_SCORE >= 0.5 else ()
+
+    monkeypatch.setattr(eval_cli, "retrieve_pool", fake_pool)
+
+    report = eval_cli.run_calibration(_Client())
+
+    by = {point.min_score: point for point in report.points}
+    assert report.in_total >= 1 and report.out_total == 5
+    # Below the fake floor: no serving evidence; above it: every query hits.
+    assert by[0.40].in_corpus_hits == 0 and by[0.40].out_of_corpus_hits == 0
+    assert by[0.70].in_corpus_hits == report.in_total
+    assert by[0.70].out_of_corpus_hits == report.out_total
+    # One pool build per labeled query per swept threshold (the serving path).
+    assert calls["n"] == (report.in_total + report.out_total) * len(report.points)

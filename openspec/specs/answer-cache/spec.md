@@ -6,8 +6,8 @@ Serve repeat operator questions from a revision-scoped answer cache so identical
 
 ## Assumptions
 
-- **A1** — Cache identity is (corpus revision, model, normalized question); a reindex or model swap invalidates all prior entries by construction. No TTL or manual flush UI in v1.
-- **A2** — v1 documents wipe-on-config-change as the invalidation contract for answer-relevant config changes (min-score, glossary, safety terms, prompt). A config fingerprint is deferred; documenting the wipe is in scope, implementing fingerprints is not.
+- **A1** — Cache identity is (corpus revision, model, config fingerprint, normalized question); a reindex, a model swap, or an answer-relevant config change invalidates all prior entries by construction. No TTL or manual flush UI in v1.
+- **A2** — The key carries a short digest of the answer-relevant config (min-score, retrieval/rerank sizes and model, prompt, closed safety-term set, ES→EN glossary), so invalidation happens by construction: a change makes every prior entry a miss and no manual wipe is required (keeping the file-wipe instruction is harmless).
 - **A3** — Cache storage is disposable, gitignored operator data; loss or corruption never degrades answering.
 
 ## Requirements
@@ -39,6 +39,12 @@ A cache hit SHALL return the stored answer immediately, bypassing retrieval and 
 
 - GIVEN a stored answer produced by model A
 - WHEN the same question is asked while model B is active
+- THEN the lookup misses and the full answering chain runs
+
+#### Scenario: Config change misses
+
+- GIVEN a stored answer for the current revision and model
+- WHEN an answer-relevant config value changes (min-score, prompt, safety terms, glossary, branch sizes)
 - THEN the lookup misses and the full answering chain runs
 
 ### Requirement: Miss path stores safely

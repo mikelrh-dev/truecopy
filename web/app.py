@@ -22,10 +22,10 @@ Conventions established here:
 
 from __future__ import annotations
 
-import io
 import time
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import streamlit as st
 
@@ -33,6 +33,9 @@ from plant_rag import config
 from plant_rag.answer.llm import LLMError
 from plant_rag.models import Answer
 from plant_rag.scheduling.scheduler import Scheduler, queue_position_es
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from plant_rag.monitoring import QueryLog
 
 from web import auth
 from web.ui_es import (
@@ -45,6 +48,7 @@ from web.ui_es import (
     LOGIN_PASSWORD_LABEL,
     LOGIN_SUBMIT,
     LOGIN_TITLE,
+    PREWARM_LABEL,
     OWNER_CODE_ADD,
     OWNER_CODE_ADD_DONE,
     OWNER_CODE_ADD_DUPLICATE,
@@ -60,7 +64,6 @@ from web.ui_es import (
     OWNER_IS_OPERATOR,
     OWNER_IS_OWNER,
     OWNER_LOGOUT,
-    OWNER_REINDEX_DONE,
     OWNER_REINDEX_FAILED,
     OWNER_REINDEX_HELP,
     OWNER_REINDEX_IN_PROGRESS,
@@ -142,8 +145,8 @@ def _set_current_user(user: auth.User | None) -> None:
 def _page_login() -> None:
     st.title(LOGIN_TITLE)
 
-    code = st.text_input(LOGIN_CODE_LABEL, key="login_code")
-    password = st.text_input(LOGIN_PASSWORD_LABEL, type="password", key="login_password")
+    st.text_input(LOGIN_CODE_LABEL, key="login_code")
+    st.text_input(LOGIN_PASSWORD_LABEL, type="password", key="login_password")
     submit = st.button(LOGIN_SUBMIT, type="primary")
 
     if submit:
@@ -301,36 +304,18 @@ def _owner_reindex() -> None:
 
 
 def _do_reindex() -> None:
-    from plant_rag import config
-    from plant_rag.ingest.reindex import run_reindex
-    from plant_rag.retrieve.embedder import get_embedder
-    from qdrant_client import QdrantClient
-
-    # Reindex without a new PDF: the CLI ``scripts/reindex.py`` does this when
-    # the owner runs it explicitly; the web button triggers the same pipeline
-    # against the currently ingested manual so the operator can rebuild after
-    # config tweaks / alias repairs without re-uploading a PDF.
-    try:
-        client = QdrantClient(url=config.QDRANT_URL, timeout=60)
-        encode = get_embedder().encode
-        current = client.get_collections()
-
-        with st.status(OWNER_REINDEX_IN_PROGRESS, expanded=True) as status:
-            status.write(OWNER_REINDEX_IN_PROGRESS)
-            status.write("Reindexación manual iniciada…")
-            # NOTE: run_reindex requires a PDF path; for a manual-only reindex
-            # the operator must use scripts/reindex.py. This button is a
-            # no-op guard that points the operator at the right tool.
-            status.update(
-                label=OWNER_REINDEX_FAILED,
-                state="error",
-            )
-            st.warning(
-                "La reindexación desde la web requiere un PDF nuevo. "
-                "Use scripts/reindex.py para reconstruir el índice actual."
-            )
-    except Exception as exc:
-        st.error(f"{OWNER_REINDEX_FAILED}: {exc}")
+    # Reindex without a new PDF is a CLI operation (``scripts/reindex.py``:
+    # rebuild the current manual after config tweaks / alias repairs). The web
+    # button cannot perform it and only points the operator at the right tool,
+    # so it opens no connection and touches no state.
+    with st.status(OWNER_REINDEX_IN_PROGRESS, expanded=True) as status:
+        status.write(OWNER_REINDEX_IN_PROGRESS)
+        status.write("Reindexación manual iniciada…")
+        status.update(label=OWNER_REINDEX_FAILED, state="error")
+        st.warning(
+            "La reindexación desde la web requiere un PDF nuevo. "
+            "Use scripts/reindex.py para reconstruir el índice actual."
+        )
 
 
 def _owner_codes(user: auth.User) -> None:
@@ -491,7 +476,7 @@ def _page_question() -> None:
         except LLMError:
             st.error(f"{ANSWER_INFRA_ERROR_LABEL}: {ANSWER_INFRA_ERROR_PROMPT}")
             answer = None
-        except Exception as exc:
+        except Exception:
             st.error(f"{ANSWER_INFRA_ERROR_LABEL}: {ANSWER_INFRA_ERROR_PROMPT}")
             answer = None
         finally:
@@ -561,14 +546,16 @@ def _generate_and_record(question: str, remaining_s: float) -> Answer:
     identical answers (the corpus is the same for everyone).
     """
     from plant_rag.answer.pipeline import answer_question
-    from plant_rag.monitoring import QueryLog
 
     answer = answer_question(
         question, remaining_s, log=_query_log(), cache=_answer_cache()
     )
-    if len(_ANSWERS) > 1000:  # bounded: a console runs for days, not forever
-        _ANSWERS.clear()
+    # Bounded: a console runs for days. Evict the OLDEST entries (dicts are
+    # insertion-ordered) instead of clearing the map — a clear could drop
+    # another session's answer that is still in flight.
     _ANSWERS[question] = answer
+    while len(_ANSWERS) > 1000:
+        _ANSWERS.pop(next(iter(_ANSWERS)))
     return answer
 
 
@@ -657,7 +644,7 @@ def _run_question(
             answer = _ANSWERS.get(question)
             if answer is not None:
                 break
-            time.sleep(0.5)
+            time.sleep(0.25)
 
     if answer is not None:
         _record_metrics(answer)
@@ -817,8 +804,46 @@ def _cast_feedback(answer: Answer, vote: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def prewarm_models() -> dict[str, bool]:
+    """Load the three heavy models, once, before the first operator question.
+
+    A cold start costs ~35-40s (BGE-M3 ~12s + reranker ~8s + qwen2.5 load
+    ~15-20s) and it lands on whoever asks first, inside the same 45s budget the
+    answer uses (ADR-005). Best-effort by design: a failed warm-up is reported
+    for the server console and the app serves anyway — the first question then
+    pays that load exactly as it did before.
+
+    Disabled by ``PLANT_RAG_PREWARM_MODELS=0`` (the hermetic suite sets it, so
+    driving the real app through AppTest never loads a checkpoint or calls
+    Ollama). Returns the per-model readiness map, empty when disabled.
+    """
+    if not config.PREWARM_MODELS:
+        return {}
+
+    from plant_rag.answer import llm as llm_mod
+    from plant_rag.retrieve import rerank as rerank_mod
+    from plant_rag.retrieve.embedder import get_embedder
+
+    ready: dict[str, bool] = {}
+    try:
+        get_embedder().encode(["calentamiento"])
+        ready["embedder"] = True
+    except Exception:  # noqa: BLE001 - warm-up must never block the app
+        ready["embedder"] = False
+    ready["reranker"] = rerank_mod.warmup()
+    ready["llm"] = llm_mod.warmup()
+    return ready
+
+
+@st.cache_resource(show_spinner=PREWARM_LABEL)
+def _prewarm_models() -> dict[str, bool]:
+    """Once per process: Streamlit reruns this file on every interaction."""
+    return prewarm_models()
+
+
 def main() -> None:
     """Login gate first, then the app page for the session's user."""
+    _prewarm_models()
     if _current_user() is None:
         _page_login()
     else:

@@ -43,6 +43,25 @@ Every indexed unit SHALL carry `revision` metadata identifying the corpus versio
 - WHEN a query runs afterward
 - THEN results originate from the new revision only
 
+### Requirement: Encoder output is real evidence
+
+Every embedded child SHALL carry a vector the encoder actually produced. The write path MUST reject an all-zero vector, failing loudly with the offending `child_id`, before any point is upserted and before any `current_*` alias moves; a rejected ingest MUST leave the previously aliased revision serving and discard the incomplete one. A vector of the correct dimensionality whose values are not all zero SHALL proceed unchanged.
+
+Rationale: a revision whose vectors are all zero validates, aliases and serves the exact refusal for every question — indistinguishable to the operator from a well-behaved out-of-corpus answer (live incident, 2026-10-10). Failure must be loud at ingest, not silent at query time.
+
+#### Scenario: Zero vector fails the ingest
+
+- GIVEN an encoder that returns an all-zero vector for a child
+- WHEN the owner ingests the manual
+- THEN the ingest fails naming the offending `child_id`
+- AND no alias moves and the incomplete revision is discarded
+
+#### Scenario: A real vector proceeds
+
+- GIVEN an encoder returning vectors of `config.EMBED_DIMS` with non-zero values
+- WHEN the owner ingests the manual
+- THEN the revision is built, count-validated and aliased as before
+
 ### Requirement: Full reindex only (single current manual)
 
 The system SHALL support full reindex as the only update mode; the index SHALL always represent exactly one current manual. Chunks from a prior index MUST NOT remain retrievable after reindex completes.

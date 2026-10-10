@@ -19,6 +19,12 @@ from __future__ import annotations
 
 LOGIN_TITLE = "Acceso al asistente de la máquina"
 
+# Shown while the app loads the embedding, reranking and LLM models once per
+# process. Without it the first screen would sit blank for ~35s before the
+# login gate renders, and the first operator question would pay that load
+# inside the 45s answer budget instead.
+PREWARM_LABEL = "Preparando el motor de búsqueda (carga de modelos)…"
+
 LOGIN_CODE_LABEL = "Código del operador"
 LOGIN_PASSWORD_LABEL = "Contraseña"
 LOGIN_SUBMIT = "Entrar"

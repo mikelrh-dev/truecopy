@@ -8,9 +8,12 @@ services:
     image: qdrant/qdrant:v1.12.6
     restart: unless-stopped
     ports:
-      # Published on all interfaces so hosts on the LAN can reach Qdrant.
-      - "6333:6333" # REST
-      - "6334:6334" # gRPC
+      # Bound to LOOPBACK: only this host (the Streamlit app and the CLIs)
+      # talks to Qdrant. It ships with NO authentication, so publishing it on
+      # the LAN would let any host read or delete the whole corpus regardless
+      # of the app login. Operators reach the app (Streamlit), never Qdrant.
+      - "127.0.0.1:6333:6333" # REST
+      - "127.0.0.1:6334:6334" # gRPC
     volumes:
       # Collection data persists across restarts. Dense vectors are created
       # with on_disk=True by retrieve/store.py (Phase 3); this mount keeps the

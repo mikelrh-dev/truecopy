@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from plant_rag import config
-from web import auth
+from web import app, auth
 from web.ui_es import (
     ANSWER_LABEL,
     ANSWER_TIMEOUT_LABEL,
@@ -105,6 +105,93 @@ def test_authenticate_same_error_for_unknown_code_and_wrong_password(tmp_path: P
         store.authenticate("noexiste", "secreto-123")
     with pytest.raises(auth.WrongPasswordError, match="incorrectos"):
         store.authenticate("op1", "secreto-456")
+
+
+def test_authenticate_accepts_a_password_with_surrounding_spaces(
+    tmp_path: Path,
+) -> None:
+    """Regression: hashing raw but verifying stripped locked such accounts out."""
+    store = make_store(tmp_path)
+    add_user(store, "op1", "  con espacios  ", owner=False)
+
+    assert store.authenticate("op1", "  con espacios  ").code == "op1"
+    # The trimmed form is a different secret, not an accepted alias.
+    with pytest.raises(auth.WrongPasswordError):
+        store.authenticate("op1", "con espacios")
+
+
+def test_create_default_users_generates_a_random_owner_password(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No fixed default credential ships in the source any more."""
+    store = auth.create_default_users(tmp_path / "users.json")
+
+    assert store.list_codes() == ["admin"]
+    assert store.owner("admin") is not None
+    err = capsys.readouterr().err
+    assert "admin" in err and "contraseña" in err  # printed once, to rotate it
+    with pytest.raises(auth.WrongPasswordError):
+        store.authenticate("admin", "admin-early-boot-owner")
+
+
+def test_create_default_users_is_idempotent(tmp_path: Path) -> None:
+    """A second boot never resets an existing owner."""
+    auth.create_default_users(tmp_path / "users.json", password="elegida-por-test")
+    again = auth.create_default_users(tmp_path / "users.json")
+
+    assert again.list_codes() == ["admin"]
+    assert again.authenticate("admin", "elegida-por-test").code == "admin"
+
+
+# --- model pre-warm (first question must not pay the load) ------------------
+
+
+def test_prewarm_is_disabled_in_the_hermetic_suite() -> None:
+    """AppTest drives the real app: pre-warm must never load a model here."""
+    assert config.PREWARM_MODELS is False
+    assert app.prewarm_models() == {}
+
+
+def test_prewarm_loads_the_three_models_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import plant_rag.answer.llm as llm_mod
+    import plant_rag.retrieve.embedder as embedder_mod
+    import plant_rag.retrieve.rerank as rerank_mod
+
+    monkeypatch.setattr(config, "PREWARM_MODELS", True)
+    loaded: list[str] = []
+
+    class FakeEmbedder:
+        def encode(self, texts):
+            loaded.append("embedder")
+            return [[0.0] * config.EMBED_DIMS for _ in texts]
+
+    monkeypatch.setattr(embedder_mod, "get_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(rerank_mod, "warmup", lambda: loaded.append("reranker") or True)
+    monkeypatch.setattr(llm_mod, "warmup", lambda: loaded.append("llm") or True)
+
+    assert app.prewarm_models() == {"embedder": True, "reranker": True, "llm": True}
+    assert loaded == ["embedder", "reranker", "llm"]
+
+
+def test_prewarm_never_blocks_the_app_when_a_model_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import plant_rag.answer.llm as llm_mod
+    import plant_rag.retrieve.embedder as embedder_mod
+    import plant_rag.retrieve.rerank as rerank_mod
+
+    monkeypatch.setattr(config, "PREWARM_MODELS", True)
+
+    def broken_embedder():
+        raise RuntimeError("weights missing")
+
+    monkeypatch.setattr(embedder_mod, "get_embedder", broken_embedder)
+    monkeypatch.setattr(rerank_mod, "warmup", lambda: False)
+    monkeypatch.setattr(llm_mod, "warmup", lambda: False)
+
+    assert app.prewarm_models() == {"embedder": False, "reranker": False, "llm": False}
 
 
 def test_owner_lookup_returns_user_only_for_owner(tmp_path: Path) -> None:

@@ -18,10 +18,19 @@ eval and the recorded runtime harness, not pytest.
 
 from __future__ import annotations
 
-import pytest
+import os
 
-from plant_rag import config
-from plant_rag.answer import pipeline
+# Before anything imports config: the web app's model pre-warm must stay off
+# under test. ``tests/test_owner_ops.py`` drives the real ``web/app.py`` through
+# Streamlit's AppTest, which would otherwise load BGE-M3 + the cross-encoder and
+# POST to Ollama inside the suite — breaking the hermetic rule the whole suite
+# is built on (it must pass with no services and no 2GB checkpoints).
+os.environ["PLANT_RAG_PREWARM_MODELS"] = "0"
+
+import pytest  # noqa: E402 - the env var above must be set before the import
+
+from plant_rag import config  # noqa: E402
+from plant_rag.answer import pipeline  # noqa: E402
 
 
 class FakeEmbedder:

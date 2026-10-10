@@ -16,13 +16,15 @@ Conventions established here (apply package-wide):
 * Every write is best-effort and never raises (the same contract as
   ``monitoring.QueryLog``): the cache is an optimization, never a
   correctness gate.
-* Invalidation contract for answer-relevant config changes (min-score,
-  glossary, safety terms, prompt) is WIPE THE FILE: a config fingerprint is
-  deferred, documenting the wipe is not (answer-cache spec, assumption A2).
+* Invalidation for answer-relevant config changes (min-score, glossary,
+  safety terms, prompt) is BY CONSTRUCTION: the cache key carries a short
+  digest of that config, so any change makes every prior entry a miss — no
+  manual wipe required (answer-cache spec, assumption A2).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import unicodedata
@@ -30,7 +32,9 @@ from collections import OrderedDict
 from pathlib import Path
 
 from plant_rag import config
+from plant_rag.answer.prompt import SAFETY_TERMS, SYSTEM_PROMPT_ES
 from plant_rag.models import Answer, Citation
+from plant_rag.retrieve.expand import GLOSSARY_ES_EN
 
 # Spanish sentence punctuation an operator types AROUND a question. Trimmed
 # from BOTH ENDS only (plus surrounding spaces): mid-question punctuation —
@@ -54,11 +58,36 @@ def normalize(question: str) -> str:
     return text.strip(_EDGE_PUNCTUATION + " ")
 
 
-Key = tuple[int | None, str, str]  # (revision, model, normalize(question))
+def _config_fingerprint() -> str:
+    """Short digest of the answer-relevant config (assumption A2).
+
+    Covers everything that can change an answer without changing the corpus
+    revision or the model: the relevance floor, retrieval/rerank sizes and
+    model, the prompt, the closed safety-term set, and the ES->EN glossary.
+    """
+    payload = "\n".join(
+        (
+            f"min_score={config.MIN_SCORE}",
+            f"top_k={config.TOP_K}",
+            f"rerank_pool={config.RERANK_POOL}",
+            f"rerank_model={config.RERANK_MODEL}",
+            f"prompt={SYSTEM_PROMPT_ES}",
+            f"safety={','.join(SAFETY_TERMS)}",
+            f"glossary={'|'.join(f'{k}:{v}' for k, v in GLOSSARY_ES_EN.items())}",
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+#:
+_CONFIG_FINGERPRINT = _config_fingerprint()
+
+# (revision, model, config fingerprint, normalize(question))
+Key = tuple[int | None, str, str, str]
 
 
 def _key(revision: int | None, model: str, question: str) -> Key:
-    return (revision, model, normalize(question))
+    return (revision, model, _CONFIG_FINGERPRINT, normalize(question))
 
 
 def _answer_from_record(data: dict) -> Answer:
@@ -112,6 +141,7 @@ class AnswerCache:
         record = {
             "revision": revision,
             "model": model,
+            "fingerprint": _CONFIG_FINGERPRINT,
             "question": question,
             "kind": answer.kind,
             "text_es": answer.text_es,
@@ -146,6 +176,8 @@ class AnswerCache:
                         continue
                     try:
                         data = json.loads(line)
+                        if data.get("fingerprint") != _CONFIG_FINGERPRINT:
+                            continue  # written under a different config: invalid
                         entry_key = _key(
                             data["revision"], data["model"], data["question"]
                         )

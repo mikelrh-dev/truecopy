@@ -7,6 +7,12 @@ An interrupted build therefore leaves the previous revision serving untouched,
 and a completed swap leaves exactly one corpus behind — queries can never mix
 old and new chunks.
 
+Encoder output is validated as EVIDENCE, not only as a shape: a vector of the
+right dimensionality whose every component is zero is refused before anything
+is upserted. Such a vector passes every other check, aliases cleanly, and then
+answers every question with the exact refusal — a silent dead corpus (live
+incident, 2026-10-10).
+
 The physical contract shared with the query path — collection naming, alias
 names, revision discovery, and collection creation (vectors on disk) — lives
 in :mod:`plant_rag.retrieve.store`; this module owns the build/validate/swap
@@ -50,6 +56,10 @@ from plant_rag.retrieve.store import (
 EncodeFn = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 
 _NAMESPACE = uuid.NAMESPACE_URL
+
+# A vector whose every component is (effectively) zero carries no signal: it
+# would produce a revision that validates, aliases and retrieves nothing.
+_ZERO_VECTOR_EPSILON = 1e-12
 
 
 @dataclass(frozen=True)
@@ -226,11 +236,22 @@ def run_reindex(
                     f"encode returned {len(vectors)} vectors for "
                     f"{len(children)} children"
                 )
-            for vector in vectors:
+            for index, vector in enumerate(vectors):
                 if len(vector) != config.EMBED_DIMS:
                     raise ValueError(
                         f"encode returned {len(vector)} dims, "
                         f"expected {config.EMBED_DIMS}"
+                    )
+                if not any(
+                    abs(float(value)) > _ZERO_VECTOR_EPSILON for value in vector
+                ):
+                    # Shape is not evidence. Refuse the dead vector here, before
+                    # any upsert and before any alias can move, so a zero-vector
+                    # encoder fails loudly instead of serving silence forever.
+                    raise ValueError(
+                        f"encode returned an all-zero vector for "
+                        f"{children[index].child_id}: refusing to index a chunk "
+                        f"with no signal"
                     )
 
             if children:

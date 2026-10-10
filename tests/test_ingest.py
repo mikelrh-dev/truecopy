@@ -521,6 +521,28 @@ def test_encode_contract_violations_are_rejected_before_swap(tmp_path) -> None:
     assert fake.collections == {}
 
 
+def test_all_zero_vectors_are_rejected_before_swap(tmp_path) -> None:
+    """A dead corpus must fail at ingest, never alias silence.
+
+    Regression for the live incident of 2026-10-10: a revision whose vectors are
+    all zero passes the dimensionality check, validates, gets aliased and then
+    answers every question with the exact refusal. The write path now refuses
+    the vector itself.
+    """
+    pdf = make_pdf(tmp_path / "v.pdf", ALARM_PAGES)
+    fake = FakeQdrant()
+
+    def zero_encoder(texts: list[str]) -> list[list[float]]:
+        return [[0.0] * config.EMBED_DIMS for _ in texts]
+
+    with pytest.raises(ValueError, match="all-zero") as excinfo:
+        run_reindex(pdf, client=fake, encode=zero_encoder, manual_id="828D")
+
+    assert "828D" in str(excinfo.value)  # names the offending child
+    assert fake.aliases == {} and fake.alias_calls == []
+    assert fake.collections == {}
+
+
 def test_reindex_rejects_blank_manual_id(tmp_path) -> None:
     pdf = make_pdf(tmp_path / "v.pdf", ALARM_PAGES)
     fake = FakeQdrant()

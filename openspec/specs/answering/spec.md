@@ -27,6 +27,30 @@ Every answer SHALL be written in operator Spanish, grounded only in retrieved pa
 - WHEN answering would require speculation
 - THEN the system refuses instead of inventing content
 
+### Requirement: No model load inside the answer budget
+
+The operator console SHALL warm the embedding, reranking and generation models before the first question is submitted, so a cold process does not spend the end-to-end budget loading checkpoints. Warm-up MUST be best-effort (a failure never blocks the app, the first question then pays the load as before) and SHALL be disableable for hermetic contexts (the test suite drives the real app through Streamlit's AppTest and MUST NOT load a checkpoint or call Ollama).
+
+Measured on 2026-10-10, Ollama unloaded and a fresh process: first question **31.0 s** cold vs **18.4 s** after warm-up (warm-up itself 17.5 s, paid while the operator logs in). Breakdown of the remaining 18.4 s: retrieval + CPU cross-encoder rerank 8.2 s, first-call prompt prefill 9.7 s (a second call with the same context: 0.9 s).
+
+#### Scenario: First question after the UI opens
+
+- GIVEN the console has just started and no question has been asked
+- WHEN the operator opens the app
+- THEN the three models are loaded before the first question is submitted
+
+#### Scenario: Warm-up failure is not an outage
+
+- GIVEN Ollama is unreachable when the app opens
+- WHEN the operator asks a question
+- THEN the app serves normally and the first question pays the load
+
+#### Scenario: Hermetic contexts stay hermetic
+
+- GIVEN `PLANT_RAG_PREWARM_MODELS=0`
+- WHEN the app runs under the test suite
+- THEN no checkpoint is loaded and no request reaches Ollama
+
 ### Requirement: Exact not-found refusal
 
 When the corpus does not contain the answer, the system SHALL reply with exactly `No aparece en la documentación`.

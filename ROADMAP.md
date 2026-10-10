@@ -1,6 +1,6 @@
 # ROADMAP — pending work
 
-Status date: 2026-10-10 · hermetic suite @ 355 green on this branch · horizon: the three
+Status date: 2026-10-10 · hermetic suite @ 362 green on this branch · horizon: the three
 items below. This file is the agent-facing index: what is left, what evidence a
 next step needs, and where it plugs in. Deep rationale lives in the archived SDD
 changes under `openspec/changes/archive/`.
@@ -54,7 +54,7 @@ collapses to the exact refusal), hermetic suite green, change archived.
 **Shipped:** `scripts/eval.py` runs four checks against a live stack (known/
 unknown alarm code, ES→EN cross-lingual, out-of-corpus refusal, per-manual
 goldens) plus the `MIN_SCORE` sweep, and can record a calibration line
-(`--record`). The hermetic suite (355 tests) proves the contracts with doubles.
+(`--record`). The hermetic suite (362 tests) proves the contracts with doubles.
 
 **What is missing:** the live run itself. Qdrant has been down on the dev
 machine, so the wiring (real embedding → real Qdrant fusion → rerank → Ollama →
@@ -78,9 +78,9 @@ golden sets (`GOLDEN_SETS` keyed by `manual_id`) and calibration records.
 
 **What is missing:** N manuals live at once. Open design questions a proposal
 must answer: one collection per manual vs per manual-revision; what the
-`current_*` aliases mean with N corpora; retrieval scoped to the selected
-manual vs across all; the answer cache key must gain `manual_id` (today it is
-revision+model+question and a shared revision number would collide); the eval
+`current_*` aliases mean with N corpora; retrieval scoped to the selectedmanual vs across all; the answer cache key must gain `manual_id` (today it is
+  revision+model+config-fingerprint+question and a shared revision number would
+  collide); the eval
 loops per manual; a selector in the web UI.
 
 **Why last:** highest value (the real use case is several documents — quality,

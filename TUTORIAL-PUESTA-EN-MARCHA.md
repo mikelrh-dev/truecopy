@@ -26,7 +26,7 @@ Esto tarda un rato (torch CPU + sentence-transformers + bge-reranker-m3).
 .\.venv\Scripts\python -m pytest tests -q
 ```
 
-Éxito esperado: `355 passed`. Si falla aquí, el entorno está mal: no sigas.
+Éxito esperado: `362 passed`. Si falla aquí, el entorno está mal: no sigas.
 
 ## Paso 1 — Levantar la infraestructura
 
@@ -92,9 +92,11 @@ marcha: es un cambio nuevo a corregir.
 .\.venv\Scripts\python scripts/run_web.py
 ```
 
-En el primer arranque se crea el propietario por defecto (código `admin`).
-Entra desde tu propio PC a `http://127.0.0.1:8501`, cambia esa contraseña y
-crea los códigos de operario (código + contraseña por persona).
+En el primer arranque se crea el propietario `admin` con una contraseña
+aleatoria que la app imprime UNA sola vez en la consola del servidor (no hay
+contraseña fija en el código): cópiala del terminal. Entra desde tu propio PC a
+`http://127.0.0.1:8501` con ese código y contraseña, cámbiala y crea los códigos
+de operario (código + contraseña por persona).
 
 Luego, desde el móvil/tablet conectado a la wifi de planta, abre
 `http://<IP-de-tu-PC>:8501`. Éxito esperado: login, preguntas y respuestas

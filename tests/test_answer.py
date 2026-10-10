@@ -21,6 +21,7 @@ from plant_rag.answer.llm import (
     LLMError,
     apply_safety_warning,
     generate,
+    warmup,
 )
 from plant_rag.answer.prompt import (
     SAFETY_TERMS,
@@ -155,7 +156,7 @@ def test_safety_warning_is_an_operator_facing_spanish_string() -> None:
 
 
 def test_validator_accepts_citations_built_from_retrieved_evidence() -> None:
-    text = f"Primera afirmación. [Fuente: 828D Página 12] Segunda. [Fuente: 828D Página 48]"
+    text = "Primera afirmación. [Fuente: 828D Página 12] Segunda. [Fuente: 828D Página 48]"
 
     citations = validate_citations(text, grounded_hits())
 
@@ -411,6 +412,51 @@ def test_llm_errors_are_never_retried() -> None:
         generate("¿cómo ajusto el offset?", grounded_hits(), transport=transport)
 
     assert len(transport.calls) == 1
+
+
+# --- warm-up: the first operator question should not pay the model load ----
+
+
+def test_warmup_loads_the_model_with_one_token_and_no_operator_output() -> None:
+    transport = FakeTransport("ok")
+
+    assert warmup(transport=transport) is True
+
+    call = transport.calls[0]
+    assert call["url"].endswith("/api/chat")
+    assert call["payload"]["model"] == config.OLLAMA_MODEL
+    assert call["payload"]["options"]["num_predict"] == 1  # load, no generation
+    assert call["payload"]["stream"] is False
+
+
+def test_warmup_asks_ollama_to_keep_the_model_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "OLLAMA_KEEP_ALIVE", "45m")
+    transport = FakeTransport("ok")
+
+    assert warmup(transport=transport) is True
+
+    assert transport.calls[0]["payload"]["keep_alive"] == "45m"
+
+
+def test_warmup_sends_no_keep_alive_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "OLLAMA_KEEP_ALIVE", "")
+    transport = FakeTransport("ok")
+
+    assert warmup(transport=transport) is True
+
+    assert "keep_alive" not in transport.calls[0]["payload"]
+
+
+def test_a_failed_warmup_is_reported_and_never_raises() -> None:
+    # Best-effort by contract: Ollama being down must not stop the app from
+    # serving, it only means the first real question pays the load.
+    transport = FakeTransport(LLMError("ollama down"))
+
+    assert warmup(transport=transport) is False
 
 
 def test_a_model_that_declines_on_its_own_is_not_retried() -> None:

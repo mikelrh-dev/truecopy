@@ -275,15 +275,15 @@ def test_suggest_carries_every_contract_field() -> None:
     assert "fuera 0/5" in text
     assert "[fresh]" in text
     assert "separates this labeled set" in text  # verbatim identifier token
-    assert CACHE_PATH in text  # floors differ -> wipe instruction
-    assert "borre" in text
+    assert CACHE_PATH in text  # floors differ -> cache note
+    assert "dejan de servirse solas" in text  # invalidates by construction
     assert "optimal" not in text.lower()
 
 
-def test_suggest_omits_the_wipe_instruction_when_the_floors_match() -> None:
+def test_suggest_omits_the_cache_note_when_the_floors_match() -> None:
     text = suggest(_build(recommended_min_score=0.40), "fresh", cache_path=CACHE_PATH)
 
-    assert "borre" not in text
+    assert "caché" not in text
     assert CACHE_PATH not in text
     assert "separates this labeled set" in text
 
@@ -296,7 +296,7 @@ def test_suggest_without_a_separating_threshold_still_carries_the_token() -> Non
     assert "ningún" in text
     assert "separates this labeled set" in text
     assert f"actual={0.40}" in text
-    assert "borre" not in text
+    assert "caché" not in text
     assert "[soft-stale]" in text
 
 
