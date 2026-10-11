@@ -84,13 +84,22 @@ Guía paso a paso con éxitos esperados y troubleshooting:
 - [ ] `scripts/query.py "<pregunta fuera de corpus>"` devuelve `No aparece en la documentación`.
 - [ ] `scripts/eval.py` pasa sus checks y sugiere `MIN_SCORE` sin cambiarlo.
 
-## La cadena (una sola, puertas en orden)
+## Cómo filtra las preguntas (puertas en orden)
 
 `answer_question` (`src/plant_rag/answer/pipeline.py`) es el único camino que
-ejecutan CLI, web y eval, de lo barato a lo estricto: caché (puerta 0) →
-pregunta vacía → vía exacta de alarmas → expansión ES→EN con backfill →
-diversidad por página → híbrido RRF con sonda → rerank top-5 → LLM con
-contrato de citas. Un arreglo aterriza en los tres a la vez.
+ejecutan CLI, web y eval. Cada puerta evita pagar la siguiente:
+
+| Puerta | Qué filtra | Si no pasa |
+|---|---|---|
+| 0. Vacía | Pregunta en blanco → `ValueError` (error de programación; ni siquiera entra en caché) | sigue |
+| Puerta 0. Caché | HIT en la misma revisión y config → sirve verbatim, sin LLM | MISS → cadena completa |
+| 1. Forma de código | 4–6 dígitos: conocida → respuesta exacta sin LLM; desconocida **con** tabla de alarmas → negativa; **sin** tabla los dígitos van al semántico como prosa | no es código → vía semántica |
+| 2a. Sonda densa | Ningún candidato sobre el suelo 0.40 → pool vacío, sin fusión RRF | hay evidencia → fusión denso+texto |
+| 2b. Diversidad y rerank | Un candidato por (manual, página), alarmas primero; el reranker corta a top-5 y la variante por palabras clave solo rellena huecos | — |
+| 3. Evidencia LLM | Pool vacío → negativa **sin llamar al modelo** | hay pool → genera sobre extractos |
+| 4. Validador de citas | Sin marcadores → negativa sin reintento; cita inválida → **un** reintento acotado, si falla niega | citas válidas → respuesta citada |
+
+Un arreglo aterriza en CLI, web y eval a la vez.
 
 ## Evaluación
 
