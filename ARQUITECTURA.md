@@ -51,7 +51,7 @@ sin APIs externas, sin nube, en desarrollo ni en producción.
 | `fastpath.py` | Vía exacta de códigos de alarma: pregunta con forma de código → MatchValue, sin embeddings ni LLM |
 
 ### Respuesta (`src/plant_rag/answer/`)
-`pipeline.py` es **la única cadena**: fastpath → expansión → multi-query con *backfill* (la variante por palabras clave solo rellena huecos, nunca desplaza) → rerank → LLM. La usan CLI, web y eval: un contrato, tres puertas.
+`pipeline.py` es **la única cadena**, de lo barato a lo estricto: caché (puerta 0) → pregunta vacía → fastpath → expansión con *backfill* (la variante por palabras clave solo rellena huecos, nunca desplaza) → diversidad por página → híbrido RRF con sonda → rerank → LLM con contrato. La usan CLI, web y eval: un contrato, puertas en orden.
 
 `llm.py` aplica el contrato: puerta de evidencia vacía (sin LLM), opciones fijas (`num_ctx=8192`, `temperature=0.2`), validador de citas, **un** reintento acotado si la cita falló pero existía, y negativa exacta si el modelo declina. `prompt.py` lleva las reglas en español (citar solo etiquetas de extractos, nunca páginas referenciadas) y el conjunto cerrado de términos de seguridad.
 

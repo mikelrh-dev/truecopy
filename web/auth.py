@@ -1,4 +1,4 @@
-"""Argon2 user store backed by a gitignored `users.json`.
+"""Argon2 user store backed by a gitignored `.streamlit-users.json`.
 
 Conventions established here:
 
@@ -6,7 +6,7 @@ Conventions established here:
   the auth layer is infrastructure, not operator dialogue (web-access-auth
   spec: "Spanish UI, English manual content").
 * The file is created lazily and written atomically via a tempfile rename so
-  a mid-write power loss never turns ``users.json`` into a half-serialized
+  a mid-write power loss never turns ``.streamlit-users.json`` into a half-serialized
   object. The file is gitignored by repo rules and MUST never be committed.
 * Password verification uses Argon2id through ``argon2-cffi``; plaintext
   passwords never persist, and rejection paths never disclose whether the

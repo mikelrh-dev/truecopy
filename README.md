@@ -14,26 +14,40 @@ cita a Manual+Página o negativa exacta. Nada sale de la máquina.
 4. Cada `[Fuente: … Página N]` se valida contra lo recuperado; si falla, negativa.
 5. `No aparece en la documentación` — exacta, sin inventar, sin parciales.
 
+Puerta 0 — caché: una pregunta ya respondida en la misma revisión y
+configuración se sirve tal cual, sin revalidar ni llamar al modelo.
+
 Detalle del mecanismo: [COMO-DECLINE-EL-SISTEMA.md](COMO-DECLINE-EL-SISTEMA.md).
 
 ## Arquitectura
 
 ```mermaid
 flowchart TD
-    Q["Pregunta en español"] --> G1{"¿Código de alarma?"}
+    Q["Pregunta en español"] --> C0{"¿En caché?"}
+    C0 -- "HIT" --> OKC["Respuesta cacheada (sin LLM)"]
+    C0 -- "MISS" --> G1{"¿Código de alarma?"}
     G1 -- "sí" --> FP["MatchValue exacto — sin embeddings, sin LLM"]
     G1 -- "no" --> EXP["Expansión ES→EN (solo para buscar)"]
-    EXP --> HIB["Qdrant: denso + texto, fusión RRF, suelo 0.40"]
+    EXP --> HIB["Qdrant: sonda densa + fusión RRF, suelo 0.40"]
     HIB --> UN["Códigos mencionados + 1 candidato por página"]
-    UN --> RER["Reranker CPU → top-5"]
+    UN --> RER["Reranker CPU → top-5 (o conserva el orden si cae)"]
     RER --> LLM["qwen2.5:7b sobre extractos etiquetados"]
     LLM --> VAL{"¿Citas verdaderas?"}
-    VAL -- "sí" --> OK["Respuesta citada"]
+    VAL -- "sí" --> OK["Respuesta citada (se guarda en caché)"]
     VAL -- "no (tras 1 reintento)" --> NO["No aparece en la documentación"]
 ```
 
 Todo local: Qdrant (Docker) + Ollama + BGE-M3 en CPU + Streamlit en LAN.
 Mapa completo: [ARQUITECTURA.md](ARQUITECTURA.md).
+
+## Sistemas que lo hacen operable
+
+| Sistema | Qué hace | Dónde |
+|---|---|---|
+| Caché de respuestas | Puerta 0: HIT sirve verbatim; cualquier cambio de revisión o config invalida por construcción | `src/plant_rag/answer/cache.py` |
+| Calibración por manual | Eval barre `MIN_SCORE` e informa; el owner aplica. Solo informa, nunca escribe config | `src/plant_rag/calibration.py`, `scripts/eval.py --record` |
+| Figuras por página | La ingesta extrae la figura de la página citada y la web la muestra junto al extracto | `src/plant_rag/ingest/figures.py` |
+| Feedback de operario | Thumbs up/down en la web, eventos en el JSONL, informe semanal con `scripts/feedback_report.py` | `web/app.py`, `src/plant_rag/monitoring.py` |
 
 ## Arranque rápido
 
@@ -42,7 +56,7 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 # `pip install -e .` NO basta: las dependencias de runtime viven en
 # requirements.txt (ADR-002), pyproject solo declara el paquete.
-.\.venv\Scripts\python -m pytest tests -q   # 362 tests herméticos, sin servicios
+.\.venv\Scripts\python -m pytest tests -q   # suite hermética, sin servicios
 
 docker compose up -d                          # Qdrant en 127.0.0.1:6333 (solo loopback)
 ollama pull qwen2.5:7b-instruct               # LLM en el host (VRAM libre)
@@ -55,57 +69,70 @@ ollama pull qwen2.5:7b-instruct               # LLM en el host (VRAM libre)
 
 .\.venv\Scripts\python scripts/query.py "700016"        # alarma conocida
 .\.venv\Scripts\python scripts/query.py "presion neumaticos"
-.\.venv\Scripts\python scripts/eval.py                   # 4 checks + barrido MIN_SCORE
+.\.venv\Scripts\python scripts/eval.py                   # checks + barrido MIN_SCORE
 .\.venv\Scripts\python scripts/run_web.py                # UI en LAN :8501
 ```
 
 Guía paso a paso con éxitos esperados y troubleshooting:
 [TUTORIAL-PUESTA-EN-MARCHA.md](TUTORIAL-PUESTA-EN-MARCHA.md).
 
-## La cadena (una sola, tres puertas)
+### Comprueba que funciona
+
+- [ ] `pytest tests -q` termina en verde (suite hermética, sin Qdrant ni Ollama).
+- [ ] `docker compose up -d` y Qdrant responde en `http://127.0.0.1:6333/readyz`.
+- [ ] `scripts/query.py "<código conocido>"` devuelve respuesta con `Manual + Página`.
+- [ ] `scripts/query.py "<pregunta fuera de corpus>"` devuelve `No aparece en la documentación`.
+- [ ] `scripts/eval.py` pasa sus checks y sugiere `MIN_SCORE` sin cambiarlo.
+
+## La cadena (una sola, puertas en orden)
 
 `answer_question` (`src/plant_rag/answer/pipeline.py`) es el único camino que
-ejecutan CLI, web y eval: fastpath → expansión → híbrido RRF → unión de
-alarmas mencionadas → diversidad por página → rerank top-5 → LLM con contrato.
-Un arreglo aterriza en los tres a la vez.
+ejecutan CLI, web y eval, de lo barato a lo estricto: caché (puerta 0) →
+pregunta vacía → vía exacta de alarmas → expansión ES→EN con backfill →
+diversidad por página → híbrido RRF con sonda → rerank top-5 → LLM con
+contrato de citas. Un arreglo aterriza en los tres a la vez.
 
 ## Evaluación
 
 `scripts/eval.py` contra la pila viva: alarma conocida/desconocida, ES→EN
 cross-lingual, negativas fuera de corpus y **goldens por manual** (páginas
 esperadas verificadas a mano; un manual sin goldens falla a propósito en vez
-de aprobarse en silencio). Además barre `MIN_SCORE` e informa sin cambiarlo.
+de aprobarse en silencio). Además barre `MIN_SCORE` e informa sin cambiarlo:
+el owner decide y aplica.
 
 ## Estructura
 
 ```
-src/plant_rag/      núcleo: config, models, monitoring
-  ingest/           loader, chunker (padre/hijo), alarms, reindex azul/verde
-  retrieve/         expand, embedder, hybrid (RRF), rerank, fastpath, store
-  answer/           pipeline, prompt, citations, llm
+src/plant_rag/      núcleo: config, models, monitoring, calibration
+  ingest/           loader, chunker (padre/hijo), alarms, figures, reindex azul/verde
+  retrieve/         expand, embedder, hybrid (RRF + sonda), rerank, fastpath, store
+  answer/           pipeline, cache (puerta 0), prompt, citations, llm
   scheduling/       cola prioritaria con plazo de 45 s
-web/                app Streamlit LAN + auth Argon2id + textos ES
-scripts/            ingest, reindex, query, run_web, eval
+web/                app Streamlit LAN + auth Argon2id + textos ES + feedback
+scripts/            ingest, reindex, query, run_web, eval, feedback_report
 tests/              suite hermética (sin Qdrant ni Ollama)
 ```
 
 ## Operación (resumen)
 
-- Servicios: Qdrant Docker + Ollama en host; todo `PLANT_RAG_*` por entorno.
+- Servicios: Qdrant en Docker + Ollama en el host; todo `PLANT_RAG_*` por entorno.
 - Qdrant publica 6333/6334 solo en `127.0.0.1`: no trae autenticación, así que
   exponerlo en la LAN daría acceso total al corpus saltándose el login de la
   app. La app (Streamlit) es la única puerta para el operario.
 - Primer arranque: la app crea el propietario `admin` con una **contraseña
   aleatoria impresa una sola vez en la consola del servidor** (no hay
   credencial fija en el código): cópiala y cámbiala en Owner > Códigos;
-  `users.json` gitignored, jamás commitear.
-- Owner: subir PDF (UUID), reindexar vía CLI, gestionar códigos.
+  `.streamlit-users.json` gitignored, jamás commitear.
+- Owner: subir PDF (UUID), reindexar vía CLI, gestionar códigos, revisar el
+  aviso de calibración tras cada reindex.
+- Día a día: preguntar en español, leer la figura junto al extracto, votar con
+  thumbs; informe semanal con `scripts/feedback_report.py`.
 - Rollback por paquetes o reset total (`down -v` + borrar datos; el núcleo intacto).
 
 ## Acceso LAN y regla de firewall (ADR-006)
 
 La app escucha en `0.0.0.0:8501` para llegar a la LAN; la regla de firewall
-es la frontera que la mantiene alcanzable only from the LAN subnet:
+es la frontera que la mantiene alcanzable solo desde la subred local:
 
 ```bash
 # Ejemplo iptables (subred del operador): aceptar la subred, tirar el resto.
