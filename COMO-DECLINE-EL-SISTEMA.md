@@ -21,7 +21,7 @@ Pregunta usada: **"¿quién fue el presidente de españa en 1995?"**
 
 | Paso | Qué hace el sistema | Resultado medido |
 |---|---|---|
-| 1 | ¿Es un código de alarma? (`\b\d{4,6}\b`) | No → camino semántico |
+| 1 | ¿Es SOLO un código de alarma? (`^\d{4,6}$` sobre la pregunta entera) | No (es una frase) → camino semántico |
 | 2 | Expande con glosario ES→EN | Sin cambios (no hay términos técnicos) |
 | 3 | Embebe la consulta (BGE-M3) | vector de 1024 dims |
 | 4 | Busca en Qdrant (`current_text`, revisión vigente) | mejores scores: **0.288, 0.261, 0.247** |
@@ -36,16 +36,60 @@ Para ver por qué el suelo está donde está (y no es un número a ojo):
 El suelo (0,40) vive en la ventana entre ambas. Una pregunta sin relación con
 el documento se queda sin evidencia antes de llegar al modelo.
 
-Nota del paso 1: el "1995" son 4 dígitos, así que el pipeline lo prueba como
-posible código de alarma. Si el manual cargado no tiene ese código (caso del
-Tesla: no hay tabla de alarmas) no aporta nada. Si la tuviera, un año podría
-colar una fila ajena: es el tradeoff documentado de la unión por mención de
-código, y el validador de citas seguiría siendo la red de seguridad.
+Nota del paso 1 (dos puertas distintas, no una): la puerta de pregunta
+completa exige que TODA la pregunta sean 4–6 dígitos (`^\d{4,6}$` con
+fullmatch), así que esta frase nunca entra ahí. Quien sí toca el "1995" es la
+**unión por mención**: extrae tokens de 4–6 dígitos (`\b\d{4,6}\b`) para
+enriquecer la evidencia — y esa vía **no puede negar**: una mención
+desconocida aporta vacío, punto. Solo una pregunta enteramente código niega
+por forma. En el Tesla (sin tabla) el "1995" no aporta nada. Si el manual
+tuviera tabla, un año podría colar una fila ajena como evidencia: es el
+tradeoff documentado de la unión por mención, y el validador de citas
+seguiría siendo la red de seguridad.
+
+**Actualización (arreglo E3).** La pregunta de arriba es una frase, así que
+nunca fue un código. Lo que cambia es el código **desnudo** (`2024`, `404`):
+en un manual **sin** tabla de alarmas ya **no** se rechaza por forma — pasa al
+camino semántico como cualquier otra pregunta, porque ahí esos dígitos son
+prosa (un año, una página, una línea de un listado). El rechazo exacto de un
+código desconocido se mantiene **donde la tabla existe**: la puerta pregunta
+primero si el corpus tiene tabla de alarmas y solo entonces niega por forma.
+
+### El mapa de puertas (de la más barata a la más estricta)
+
+```mermaid
+flowchart TD
+    Q["Pregunta"] --> B{"¿En blanco?"}
+    B -- "sí" --> ERR["ValueError (ni entra en caché)"]
+    B -- "no" --> C0{"¿En caché?"}
+    C0 -- "HIT" --> OKC["Sirve verbatim: salta TODAS las capas"]
+    C0 -- "MISS" --> G1{"¿TODA ella 4-6 dígitos?"}
+    G1 -- "sí, conocido" --> EX["Respuesta exacta (sin LLM)"]
+    G1 -- "sí, desconocido + tabla" --> NO1["Negativa exacta"]
+    G1 -- "sí, desconocido sin tabla" --> SEM["Al semántico: son prosa"]
+    G1 -- "no, es frase" --> SEM["Camino semántico"]
+    SEM --> MEN["Unión por mención: los dígitos solo aportan evidencia, nunca niegan"]
+    MEN --> S{"¿Sonda densa sobre 0,40?"}
+    S -- "no" --> NO2["Negativa exacta (el LLM no se invoca)"]
+    S -- "sí" --> FUS["Fusión RRF + diversidad + rerank top-5"]
+    FUS --> LLM["LLM sobre extractos etiquetados"]
+    LLM --> VAL{"¿Citas válidas?"}
+    VAL -- "sí" --> OK["Respuesta citada"]
+    VAL -- "sin marcadores" --> NO3["Negativa (sin reintento)"]
+    VAL -- "cita inválida" --> RE["UN reintento acotado"]
+    RE --> OK
+    RE --> NO4["Negativa"]
+```
 
 ---
 
-## 3. Las cuatro capas (de la más barata a la más estricta)
+## 3. Las capas (puerta 0 + cuatro, de la más barata a la más estricta)
 
+0. **Puerta 0 — caché** — un HIT sirve la respuesta guardada verbatim y
+   **salta todas las capas**: ni sonda, ni validador, ni LLM. El mitigante es
+   la clave (revisión + modelo + fingerprint de config): un reindex o un
+   cambio de config invalida por construcción. El vector restante es
+   operativo, no de IA: alguien con acceso a la máquina edita el JSONL local.
 1. **Suelo de relevancia** — todo pasaje por debajo de 0,40 se descarta antes
    de existir. Medido, no estimado.
 2. **Puerta de evidencia vacía** — si no queda ningún pasaje, la negativa
@@ -69,6 +113,7 @@ Detrás de todo, el plazo de 45 s: un cuelgue produce el aviso de timeout,
 
 | Capa | Falla si… | Consecuencia | Quién lo cubre |
 |---|---|---|---|
+| Caché (puerta 0) | el JSONL local contiene una entrada falsa | se sirve verbatim sin validador | clave con revisión+fingerprint (invalida por construcción); fichero local, gitignored, append-only |
 | Suelo | pregunta fuera del corpus comparte vocabulario y pasa de 0,40 | entran pasajes basura | el modelo declina con basura delante (medido), y si no, el validador |
 | Puerta vacía | nunca falla: es binaria (pool vacío o no) | — | — |
 | Validador de citas | el modelo cita una página **recuperada de verdad** que no responde a la pregunta | respuesta inventada con cita válida → **hueco residual real** | `temperature=0.2`, prompt extractivo, extracto visible para verificar en un clic |
