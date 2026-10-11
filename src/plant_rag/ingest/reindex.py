@@ -7,6 +7,12 @@ An interrupted build therefore leaves the previous revision serving untouched,
 and a completed swap leaves exactly one corpus behind — queries can never mix
 old and new chunks.
 
+Encoder output is validated as EVIDENCE, not only as a shape: a vector of the
+right dimensionality whose every component is zero is refused before anything
+is upserted. Such a vector passes every other check, aliases cleanly, and then
+answers every question with the exact refusal — a silent dead corpus (live
+incident, 2026-10-10).
+
 The physical contract shared with the query path — collection naming, alias
 names, revision discovery, and collection creation (vectors on disk) — lives
 in :mod:`plant_rag.retrieve.store`; this module owns the build/validate/swap
@@ -16,6 +22,7 @@ pipeline itself.
 from __future__ import annotations
 
 import uuid
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +39,7 @@ from qdrant_client.http.models import (
 from plant_rag import config
 from plant_rag.ingest.alarms import AlarmRow, extract_alarms
 from plant_rag.ingest.chunker import ChildChunk, ParentChunk, chunk_page
+from plant_rag.ingest.figures import save_page_figures
 from plant_rag.ingest.loader import iter_batches
 from plant_rag.retrieve.store import (
     ALARMS_ALIAS,
@@ -49,6 +57,10 @@ from plant_rag.retrieve.store import (
 EncodeFn = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 
 _NAMESPACE = uuid.NAMESPACE_URL
+
+# A vector whose every component is (effectively) zero carries no signal: it
+# would produce a revision that validates, aliases and retrieves nothing.
+_ZERO_VECTOR_EPSILON = 1e-12
 
 
 @dataclass(frozen=True)
@@ -139,6 +151,20 @@ def _point_id(key: str) -> str:
     return str(uuid.uuid5(_NAMESPACE, f"plant-rag:{key}"))
 
 
+def manual_id_from_filename(filename: str) -> str:
+    """The ingested ``manual_id`` for an upload: the PDF stem, sanitized.
+
+    ONE definition for every entrypoint (CLI ``ingest``/``reindex`` and the
+    web upload), so the same file always lands in the same identity
+    namespace: goldens, calibration records and citations all key on it.
+    The filesystem path never carries this identity (uploads are staged
+    under a UUID name for safety); only the manual's name does.
+    """
+    stem = Path(filename).stem
+    cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", stem).strip("_")
+    return cleaned or "manual-sin-nombre"
+
+
 def run_reindex(
     pdf_path: str | Path,
     *,
@@ -181,6 +207,7 @@ def run_reindex(
     previous = current_revision(client)
     text_points = 0
     alarm_points = 0
+    figure_pages: set[int] = set()
 
     try:
         # Collections exist before any data: an interrupted run can never be
@@ -193,6 +220,8 @@ def run_reindex(
         for batch in iter_batches(pdf_path, batch_pages):
             pairs: list[tuple[ParentChunk, ChildChunk]] = []
             alarm_rows: list[tuple[int, AlarmRow]] = []
+            batch_figure_pages = {page.number for page in batch if page.has_figures}
+            figure_pages |= batch_figure_pages
             for page in batch:
                 parent, page_children = chunk_page(
                     page, manual_id=manual_id, revision=revision_tag
@@ -211,11 +240,22 @@ def run_reindex(
                     f"encode returned {len(vectors)} vectors for "
                     f"{len(children)} children"
                 )
-            for vector in vectors:
+            for index, vector in enumerate(vectors):
                 if len(vector) != config.EMBED_DIMS:
                     raise ValueError(
                         f"encode returned {len(vector)} dims, "
                         f"expected {config.EMBED_DIMS}"
+                    )
+                if not any(
+                    abs(float(value)) > _ZERO_VECTOR_EPSILON for value in vector
+                ):
+                    # Shape is not evidence. Refuse the dead vector here, before
+                    # any upsert and before any alias can move, so a zero-vector
+                    # encoder fails loudly instead of serving silence forever.
+                    raise ValueError(
+                        f"encode returned an all-zero vector for "
+                        f"{children[index].child_id}: refusing to index a chunk "
+                        f"with no signal"
                     )
 
             if children:
@@ -233,6 +273,11 @@ def run_reindex(
                                 "parent_id": child.parent_id,
                                 "child_text": child.text,
                                 "parent_text": parent.text,
+                                # A figure rides BESIDE the answer, never in it
+                                # (answering spec): the web shows the page's
+                                # saved figure only when this flag is set AND
+                                # the file exists.
+                                "has_figures": child.page in batch_figure_pages,
                             },
                         )
                         for (parent, child), vector in zip(pairs, vectors)
@@ -266,6 +311,19 @@ def run_reindex(
 
         if text_points == 0:
             raise ValueError(f"no indexable text found in {pdf_path}")
+        # Save the flagged pages' figures BEFORE the swap: a figure is a trust
+        # aid, so a disk failure must never abort a revision (best-effort).
+        if figure_pages and str(config.FIGURES_DIR).strip():
+            try:
+                save_page_figures(
+                    pdf_path,
+                    sorted(figure_pages),
+                    figures_dir=config.FIGURES_DIR,
+                    revision=revision_tag,
+                    manual_id=manual_id,
+                )
+            except Exception:  # noqa: BLE001 - figures never fail an ingest
+                pass
         validate_revision(client, revision, text_points, alarm_points)
         swap_aliases(client, revision)
     except BaseException:

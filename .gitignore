@@ -33,8 +33,14 @@ users.json
 # Operator data (JSONL, local-only by design): query log + answer cache
 logs/
 
-# Third-party manual PDFs (weight + copyright: never versioned, never pushed)
+# Extracted page figures (derived from the operator's PDFs, local-only by design)
+data/figures/
+
+# Third-party manual PDFs (weight + copyright: never versioned, never pushed).
+# Both spellings are covered: the English path used in docs and the Spanish
+# folder an owner may create locally.
 documentation/*.pdf
+documentacion/*.pdf
 
 # Local MLflow tracking (future, machine-local by design)
 mlruns/

@@ -38,14 +38,9 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 
 from plant_rag import config
 from plant_rag.calibration import advisory
-from plant_rag.ingest.reindex import run_reindex
+from plant_rag.ingest.reindex import manual_id_from_filename, run_reindex
 from plant_rag.retrieve.embedder import get_embedder
 from qdrant_client import QdrantClient
-
-
-def _manual_id_from_path(pdf_path: Path) -> str:
-    """Derive a stable manual identifier from the filename (no extension)."""
-    return pdf_path.stem.replace(" ", "_").replace("-", "_")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -70,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: manual PDF not found: {pdf_path}", file=sys.stderr)
         return 1
 
-    manual_id = args.manual_id or _manual_id_from_path(pdf_path)
+    manual_id = args.manual_id or manual_id_from_filename(pdf_path.name)
 
     print(f"Ingesting {pdf_path} as manual '{manual_id}'...")
     print(f"Qdrant: {config.QDRANT_URL}")

@@ -521,6 +521,28 @@ def test_encode_contract_violations_are_rejected_before_swap(tmp_path) -> None:
     assert fake.collections == {}
 
 
+def test_all_zero_vectors_are_rejected_before_swap(tmp_path) -> None:
+    """A dead corpus must fail at ingest, never alias silence.
+
+    Regression for the live incident of 2026-10-10: a revision whose vectors are
+    all zero passes the dimensionality check, validates, gets aliased and then
+    answers every question with the exact refusal. The write path now refuses
+    the vector itself.
+    """
+    pdf = make_pdf(tmp_path / "v.pdf", ALARM_PAGES)
+    fake = FakeQdrant()
+
+    def zero_encoder(texts: list[str]) -> list[list[float]]:
+        return [[0.0] * config.EMBED_DIMS for _ in texts]
+
+    with pytest.raises(ValueError, match="all-zero") as excinfo:
+        run_reindex(pdf, client=fake, encode=zero_encoder, manual_id="828D")
+
+    assert "828D" in str(excinfo.value)  # names the offending child
+    assert fake.aliases == {} and fake.alias_calls == []
+    assert fake.collections == {}
+
+
 def test_reindex_rejects_blank_manual_id(tmp_path) -> None:
     pdf = make_pdf(tmp_path / "v.pdf", ALARM_PAGES)
     fake = FakeQdrant()
@@ -726,3 +748,174 @@ def test_ingest_advisory_never_mutates_config_or_the_store(
     assert not (tmp_path / "answer-cache.jsonl").exists()
     assert calls == [{"manual_id": "828D", "client": calls[0]["client"]}]
     assert len(calls) == 1  # exactly one reindex: the advisory adds none
+
+
+def test_reindex_cli_prints_the_same_calibration_advisory(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The replacement CLI carries the same advisory as the first-load one.
+
+    Same contract as ``ingest.py``: one read-only Spanish line after the
+    summary, derived from the calibration record for this manual id.
+    """
+    import scripts.reindex as reindex_cli
+    from plant_rag.retrieve import store as store_mod
+
+    cal_path = tmp_path / "calibration.jsonl"
+    _seed_calibration_record(cal_path)
+    monkeypatch.setattr(config, "CALIBRATION_PATH", str(cal_path))
+    monkeypatch.setattr(
+        config, "ANSWER_CACHE_PATH", str(tmp_path / "answer-cache.jsonl")
+    )
+    monkeypatch.setattr(store_mod, "current_revision", lambda client: 2)
+
+    class _FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+    monkeypatch.setattr(reindex_cli, "QdrantClient", _FakeClient)
+    monkeypatch.setattr(
+        reindex_cli,
+        "get_embedder",
+        lambda: SimpleNamespace(encode=lambda texts: [[0.0] * 8 for _ in texts]),
+    )
+    monkeypatch.setattr(
+        reindex_cli,
+        "run_reindex",
+        lambda pdf, *, client, encode, manual_id, batch_pages: SimpleNamespace(
+            revision="r3", text_points=10, alarm_points=3, previous_revision="r2",
+            stale_collections=[],
+        ),
+    )
+    pdf = make_pdf(tmp_path / "v.pdf", ["body"])
+
+    assert reindex_cli.main([str(pdf), "--manual-id", "828D"]) == 0
+
+    out = capsys.readouterr().out
+    assert "OK — revisión r3 en servicio" in out  # the summary comes first
+    assert "Sugerencia de calibración [fresh]" in out
+    assert "separates this labeled set" in out
+
+
+def test_manual_id_from_filename_is_the_single_sanitized_identity() -> None:
+    """One helper owns the identity, so the file names the manual everywhere.
+
+    The web upload stages bytes under a UUID name and the CLI reads a path, but
+    both derive the SAME id from the manual's own filename (audit A1).
+    """
+    from plant_rag.ingest.reindex import manual_id_from_filename
+
+    assert manual_id_from_filename("manual de calidad.pdf") == "manual_de_calidad"
+    assert manual_id_from_filename("828D-manual.pdf") == "828D_manual"
+    assert manual_id_from_filename("carpeta/manual.pdf") == "manual"
+    assert manual_id_from_filename("...pdf") == "manual-sin-nombre"
+    assert manual_id_from_filename("Manual.pdf") == manual_id_from_filename("Manual.pdf")
+
+
+def test_ingest_cli_derives_its_id_from_the_filename_when_no_flag(
+    tmp_path, monkeypatch
+) -> None:
+    """Without ``--manual-id`` the ingest CLI uses the same filename identity."""
+    import scripts.ingest as ingest_cli
+
+    calls = _patch_ingest_harness(monkeypatch, tmp_path, "")
+    pdf = make_pdf(tmp_path / "manual de calidad.pdf", ["body"])
+
+    assert ingest_cli.main([str(pdf)]) == 0
+    assert calls[0]["manual_id"] == "manual_de_calidad"
+
+
+# --- figures: page images extracted at ingest (phase-1 [IMAGEN] handling) ---
+
+
+def make_pdf_with_image(path, *, pages: int = 1, image_on: int = 1):
+    """A PDF whose ``image_on`` page carries text AND an embedded raster image."""
+    doc = fitz.open()
+    for index in range(1, pages + 1):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Page {index} body", fontsize=11)
+        if index == image_on:
+            pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 24, 24))
+            pix.clear_with(128)
+            page.insert_image(fitz.Rect(72, 100, 172, 200), pixmap=pix)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def test_loader_flags_only_pages_with_images(tmp_path) -> None:
+    from plant_rag.ingest import figures  # noqa: F401 - import surface check
+
+    pdf = make_pdf_with_image(tmp_path / "m.pdf", pages=3, image_on=2)
+    pages = [p for batch in iter_batches(pdf, batch_pages=10) for p in batch]
+
+    assert [p.has_figures for p in pages] == [False, True, False]
+
+
+def test_figure_path_is_deterministic_and_filesystem_safe() -> None:
+    from plant_rag.ingest.figures import figure_path
+
+    path = figure_path("data/figures", "r3", "Owners/Manual", 98)
+
+    assert path.parts[-3:] == ("r3", "Owners_Manual", "page-98.png")
+    assert figure_path("d", "r1", "M", 5) == figure_path("d", "r1", "M", 5)
+
+
+def test_save_page_figures_writes_a_png_and_skips_empty_pages(tmp_path) -> None:
+    from plant_rag.ingest.figures import save_page_figures
+
+    pdf = make_pdf_with_image(tmp_path / "m.pdf", pages=2, image_on=1)
+    out = tmp_path / "figs"
+
+    saved = save_page_figures(
+        pdf, [1, 2], figures_dir=out, revision="r1", manual_id="M"
+    )
+
+    assert set(saved) == {1}  # page 2 has no image
+    data = saved[1].read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_save_page_figures_disabled_by_a_blank_dir(tmp_path) -> None:
+    from plant_rag.ingest.figures import save_page_figures
+
+    pdf = make_pdf_with_image(tmp_path / "m.pdf", image_on=1)
+
+    assert save_page_figures(pdf, [1], figures_dir="", revision="r1", manual_id="M") == {}
+
+
+def test_reindex_records_the_figure_flag_and_saves_the_file(
+    tmp_path, monkeypatch
+) -> None:
+    from plant_rag.ingest.figures import figure_path
+
+    monkeypatch.setattr(config, "FIGURES_DIR", str(tmp_path / "figs"))
+    pdf = make_pdf_with_image(tmp_path / "m.pdf", pages=2, image_on=1)
+    fake = FakeQdrant()
+
+    run_reindex(pdf, client=fake, encode=fake_encode, manual_id="M")
+
+    flags = {
+        point["payload"]["page"]: point["payload"]["has_figures"]
+        for point in fake.collections["manual_r1_text"].values()
+    }
+    assert flags == {1: True, 2: False}
+    saved = figure_path(config.FIGURES_DIR, "r1", "M", 1)
+    assert saved.is_file() and saved.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_a_figure_failure_never_fails_the_ingest(tmp_path, monkeypatch) -> None:
+    from plant_rag.ingest import reindex as reindex_mod
+
+    monkeypatch.setattr(config, "FIGURES_DIR", str(tmp_path / "figs"))
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("disk exploded")
+
+    monkeypatch.setattr(reindex_mod, "save_page_figures", _boom)
+    pdf = make_pdf_with_image(tmp_path / "m.pdf", image_on=1)
+    fake = FakeQdrant()
+
+    result = run_reindex(pdf, client=fake, encode=fake_encode, manual_id="M")
+
+    assert result.revision == "r1"  # figures are a trust aid, never a gate

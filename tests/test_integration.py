@@ -25,11 +25,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import pytest
-
 from plant_rag import config
 from plant_rag.models import Answer, Citation, REFUSAL_ES
-from plant_rag.scheduling.scheduler import Scheduler, queue_position_es
+from plant_rag.scheduling.scheduler import Scheduler
 from plant_rag.retrieve.store import (
     ALARMS_ALIAS,
     TEXT_ALIAS,
@@ -120,6 +118,7 @@ class FakeQdrantClient:
         with_vectors: bool = False,
         prefetch: Any = None,
         timeout: float | None = None,
+        score_threshold: float | None = None,
     ) -> _QueryResponse:
         if collection_name != "manual_r1_text":
             return _QueryResponse(points=[])
@@ -138,6 +137,10 @@ class FakeQdrantClient:
             )
 
         scored = sorted(self._text_points, key=lambda p: -p.score)
+        if score_threshold is not None:
+            # A plain (non-prefetch) query honors score_threshold on the real
+            # server too; mirror it so the pool-level floor is exercised.
+            scored = [point for point in scored if point.score >= score_threshold]
         return _QueryResponse(points=scored[:limit])
 
     # alarm scroll -----------------------------------------------------------
@@ -416,8 +419,6 @@ def test_no_evidence_means_no_llm_call() -> None:
 
 
 def test_expired_query_returns_spanish_timeout_not_partial_answer() -> None:
-    from plant_rag.scheduling.scheduler import AGED_AFTER_S
-
     class FakeClock:
         def __init__(self) -> None:
             self._now = 0.0

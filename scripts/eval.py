@@ -67,12 +67,12 @@ from plant_rag.calibration import append_record, build_record
 from plant_rag.models import Answer, REFUSAL_ES
 from plant_rag.scheduling.scheduler import Scheduler
 from plant_rag.retrieve.embedder import get_embedder
+from plant_rag.retrieve.expand import expand_query
 from plant_rag.retrieve.store import (
     TEXT_ALIAS,
     current_target,
     current_revision,
     list_revisions,
-    search as store_search,
     text_collection,
 )
 from plant_rag.answer.pipeline import answer_question, retrieve_and_rank, retrieve_pool
@@ -207,15 +207,19 @@ GOLDEN_SETS: tuple[ManualGoldenSet, ...] = (
         cases=(
             # Tesla Model 3 owner's manual, verified live against revision r6.
             GoldenCase("presion neumaticos", frozenset({98, 99, 205, 206, 294})),
-            # Dashboard warning lights live in the manual's "Warning Lights" /
-            # indicator section (pages 75-81); "luces de testigo" is the
-            # operator's phrasing for it. The earlier golden expected the
-            # charge-port lights page (187) — a mis-recorded interpretation
-            # that only passed by reranker luck, corrected here against the
-            # manual's real section.
+            # Dashboard indicator lights: the manual's own section titles put
+            # them on pages 15-16 ("Indicator Lights"). "luces de testigo" is
+            # the operator's phrasing for exactly that content. Measured
+            # against the live corpus on 2026-10-10: the previous expectations
+            # (75, 76, 79, 81) were mis-recorded — 75 is "High Beam
+            # Headlights", 79 is "Emergency Braking", 81 is "Parking Brake"
+            # — and the case only passed because page 76 ("Headlight Indicator
+            # Lights") happened to rank. Expecting the brake pages gave false
+            # assurance: an ideal English query ("warning lights") does not
+            # surface 75/81 either, so this was never a recall gap to fix.
             GoldenCase(
                 "que luces de testigo hay en el cuadro",
-                frozenset({75, 76, 79, 81}),
+                frozenset({15, 16}),
             ),
             GoldenCase("como uso autopilot?", frozenset({115})),
             # Speed Assist / speed limit configuration: "How Speed Assist
@@ -330,10 +334,10 @@ def check_alarm_known_and_unknown(
     unknown_code = "000000" if known_code != "000000" else "999999"
 
     scheduler = Scheduler(_generate)
-    position_known = scheduler.submit(known_code)
+    scheduler.submit(known_code)
     answer_known = scheduler.run_once()
 
-    position_unknown = scheduler.submit(unknown_code)
+    scheduler.submit(unknown_code)
     answer_unknown = scheduler.run_once()
 
     detail_parts: list[str] = []
@@ -515,7 +519,7 @@ def check_refusal_out_of_corpus(client: QdrantClient) -> EvalResult:
     passed = True
 
     for question in candidates:
-        position = scheduler.submit(question)
+        scheduler.submit(question)
         answer = scheduler.run_once()
         if answer is None:
             results.append(f"{question}: no answer produced")
@@ -580,7 +584,6 @@ def check_golden_grounding(
             ),
         )
 
-    embedder = get_embedder()
     failures: list[str] = []
     successes: list[str] = []
 
@@ -705,11 +708,15 @@ def _spanish_question_for_english_text(text: str) -> str:
 def run_calibration(client: QdrantClient) -> CalibrationReport:
     """Sweep MIN_SCORE against labeled in-corpus and out-of-corpus cases.
 
-    Queries are embedded ONCE (the sweep only varies the threshold, which
-    ``store_search`` reads from ``config.MIN_SCORE`` at call time), so a
-    threshold sweep costs seven searches, not seven embeds per query. The
-    two classes are counted separately and returned with their totals; the
-    caller reports a recommendation WITHOUT changing config.MIN_SCORE.
+    Queries are embedded ONCE, in EXPANDED form exactly like serving (the
+    dense branch embeds the ES->EN expansion), and each swept threshold is
+    probed through the SERVING pool builder (``retrieve_pool`` -> hybrid), which
+    reads ``config.MIN_SCORE`` live on its dense branch. So a sweep costs seven
+    pool builds, not seven embeds per query, and it measures the same path that
+    answers operators (it previously probed ``store.search``, dense-only, and
+    could recommend a floor serving never applied). The two classes are counted
+    separately and returned with their totals; the caller reports a
+    recommendation WITHOUT changing config.MIN_SCORE.
 
     A failure here is NOT swallowed: calibration that cannot run must exit 1
     (exit-code contract) rather than print a sweep built on silently skipped
@@ -759,13 +766,14 @@ def run_calibration(client: QdrantClient) -> CalibrationReport:
         "cuál es la receta del cake de chocolate",
     ]
 
-    # Embed every labeled query exactly once, before the threshold varies.
-    in_vectors = [
-        (query, embedder.encode([query])[0]) for query in in_corpus_queries
-    ]
-    out_vectors = [
-        (query, embedder.encode([query])[0]) for query in out_of_corpus_queries
-    ]
+    # Embed every labeled query exactly once, EXPANDED (serving embeds the
+    # ES->EN expansion), before the threshold varies.
+    def _embed(question: str) -> tuple[str, list[float]]:
+        expanded = expand_query(question)
+        return expanded, embedder.encode([expanded])[0]
+
+    in_vectors = [_embed(query) for query in in_corpus_queries]
+    out_vectors = [_embed(query) for query in out_of_corpus_queries]
 
     # Sweep thresholds.
     thresholds = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
@@ -773,18 +781,18 @@ def run_calibration(client: QdrantClient) -> CalibrationReport:
     original = config.MIN_SCORE
     try:
         for threshold in thresholds:
-            # Temporarily override MIN_SCORE: store.search reads it live, so
-            # this probes the real serving path at each candidate floor.
+            # Temporarily override MIN_SCORE: the serving pool builder reads it
+            # live on the dense branch, so the sweep measures the real path.
             config.MIN_SCORE = threshold
             above_in = sum(
                 1
-                for _, vector in in_vectors
-                if store_search(client, vector)
+                for expanded, vector in in_vectors
+                if retrieve_pool(client, expanded, vector)
             )
             above_out = sum(
                 1
-                for _, vector in out_vectors
-                if store_search(client, vector)
+                for expanded, vector in out_vectors
+                if retrieve_pool(client, expanded, vector)
             )
             calibration_points.append(
                 CalibrationPoint(
@@ -940,7 +948,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    print(f"Plant RAG evaluation")
+    print("Plant RAG evaluation")
     print(f"Qdrant: {config.QDRANT_URL}")
     print(f"Ollama: {config.OLLAMA_URL} (model {config.OLLAMA_MODEL})")
     print(f"MIN_SCORE (current): {config.MIN_SCORE}")
@@ -1007,6 +1015,16 @@ def main(argv: list[str] | None = None) -> int:
                 (r for r in results if r.name == "golden grounding"), None
             )
             _append_calibration_record(client, manual_id, report, golden_result)
+        elif args.record:
+            # The owner asked for a record and got none: say why on stderr
+            # (stdout stays byte-identical to the pre-change eval output).
+            if not all_passed:
+                why = "hay checks en rojo"
+            elif not report.points:
+                why = "el barrido no produjo ningún punto (corpus vacío)"
+            else:
+                why = "CALIBRATION_PATH está desactivado"
+            print(f"nota: no se grabó registro de calibración ({why})", file=sys.stderr)
 
     print("-" * 60)
     return 0 if all_passed else 1

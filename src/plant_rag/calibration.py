@@ -203,9 +203,11 @@ def suggest(
 
     Every line shows both floors, revision, record date, corpus counts,
     golden counts, and the staleness ``label``; the verbatim identifier
-    ``separates this labeled set`` is always present; the answer-cache wipe
-    instruction appears iff the recommended floor differs from the current
-    one. Read-only: this never writes config, store, or index.
+    ``separates this labeled set`` is always present; the cache note appears
+    iff the recommended floor differs from the current one and states that
+    prior cached answers invalidate BY CONSTRUCTION (the cache key carries a
+    config fingerprint, so no manual wipe is needed). Read-only: this never
+    writes config, store, or index.
     """
     recommended = rec.get("recommended_min_score")
     current = rec.get("current_min_score")
@@ -224,11 +226,17 @@ def suggest(
             wipe = ""
         elif cache_path:
             wipe = (
-                f"; borre la caché de respuestas en {cache_path} para que el "
-                "nuevo suelo surta efecto"
+                f"; aplique PLANT_RAG_MIN_SCORE={recommended}: el suelo nuevo "
+                f"surte efecto en la próxima consulta y las respuestas ya "
+                f"cacheadas en {cache_path} dejan de servirse solas (la huella "
+                "de config cambia)"
             )
         else:
-            wipe = "; borre la caché de respuestas para que el nuevo suelo surta efecto"
+            wipe = (
+                f"; aplique PLANT_RAG_MIN_SCORE={recommended}: el suelo nuevo "
+                "surte efecto en la próxima consulta y la caché de respuestas "
+                "se invalida sola (la huella de config cambia)"
+            )
 
     golden_pass = rec.get("golden_pass")
     golden_total = rec.get("golden_total")

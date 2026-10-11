@@ -54,10 +54,45 @@ def _env_float(name: str, default: float) -> float:
         ) from exc
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Return the ``PLANT_RAG_<name>`` boolean override or ``default``.
+
+    Accepts ``1/0``, ``true/false``, ``yes/no`` and ``on/off`` in any case.
+
+    Raises:
+        ValueError: if the override is set but is not a recognized boolean —
+            a typo must fail loudly instead of silently disabling a feature.
+    """
+    raw = os.environ.get(_ENV_PREFIX + name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{_ENV_PREFIX}{name} must be a boolean, got {raw!r}")
+
+
 # --- Service endpoints (local-only defaults) -------------------------------
 QDRANT_URL = _env_str("QDRANT_URL", "http://127.0.0.1:6333")
 OLLAMA_URL = _env_str("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = _env_str("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+# How long Ollama keeps the model in memory after a WARM-UP request. Loading
+# qwen2.5:7b takes ~15-20s, which lands on the first operator question after the
+# UI opens (the end-to-end budget is 45s), so the app pre-warms and asks for a
+# keep-alive window instead of leaving the model to unload on its default idle
+# timer. Holding ~4.7GB of VRAM is the explicit trade-off; set to "" to send no
+# keep_alive at all (Ollama's own default applies). This affects the warm-up
+# request only — per-query payloads stay unchanged.
+OLLAMA_KEEP_ALIVE = _env_str("OLLAMA_KEEP_ALIVE", "30m")
+# Warm the three heavy models when the web UI opens, so the FIRST operator
+# question does not pay ~35-40s of model loading inside the 45s answer budget
+# (measured live: 38-44s cold vs 5-7s warm). ON by default for the operator
+# console. The hermetic test suite sets it to 0, because it drives the real
+# app through Streamlit's AppTest and must never load a checkpoint or call
+# Ollama.
+PREWARM_MODELS = _env_bool("PREWARM_MODELS", True)
 
 # --- Ingestion ------------------------------------------------------------
 # 100-page batches keep peak RSS inside the 16GB budget (ADR-002).
@@ -83,6 +118,17 @@ if RERANK_POOL < TOP_K:
 # BGE-M3 forward-pass batch on CPU: 32 children x ~1000 chars stay well inside
 # the 2.5GB fp32 RAM line from ADR-002 without slowing encoding down.
 EMBED_BATCH_SIZE = _env_int("EMBED_BATCH_SIZE", 32)
+
+# --- Figures (phase-1 image support, heuristic, no vision model) -----------
+# Directory where the ingest pipeline saves the largest embedded figure of
+# each page that HAS one, so the web can show it beside a cited page's excerpt
+# ("[IMAGEN] handling", deferred in the original proposal). The layout is
+# ``<dir>/<revision>/<manual_id>/page-<N>.png``; the web derives the path and
+# only loads it when the file exists. Extraction is PyMuPDF-only (already a
+# dependency): NO vision model, no new download, no VRAM — the ADR-002 budget
+# stays intact. Set to "" to disable figure extraction entirely (the ingest
+# then writes no files and every page's ``has_figures`` payload flag is False).
+FIGURES_DIR = _env_str("FIGURES_DIR", "data/figures")
 
 # --- Answering -------------------------------------------------------------
 # Relevance floor for semantic hits (decision deferred from Unit 3, closed

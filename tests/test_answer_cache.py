@@ -148,6 +148,23 @@ def test_reload_trims_to_the_newest_cap(tmp_path) -> None:
     assert reloaded.lookup(1, "m", "pregunta 0") is None
 
 
+def test_a_config_change_invalidates_prior_entries(tmp_path, monkeypatch) -> None:
+    """assumption A2: the key carries a config digest, so a change misses."""
+    from plant_rag.answer import cache as cache_mod
+
+    path = tmp_path / "cache.jsonl"
+    cached = AnswerCache(path)
+    cached.store(3, "model-a", "¿Qué es el TIA?", _answer())
+    assert cached.lookup(3, "model-a", "¿Qué es el TIA?") == _answer()
+
+    # An answer-relevant config change moves the fingerprint; a fresh cache on
+    # the same file must treat every prior line as invalid (no manual wipe).
+    monkeypatch.setattr(cache_mod, "_CONFIG_FINGERPRINT", "different-config")
+    fresh = AnswerCache(path)
+
+    assert fresh.lookup(3, "model-a", "¿Qué es el TIA?") is None
+
+
 # ---------------------------------------------------------------------------
 # tolerance: corrupt records, unreadable file, failed writes
 # ---------------------------------------------------------------------------

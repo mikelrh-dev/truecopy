@@ -161,6 +161,7 @@ class FakeQdrant:
         with_vectors=False,
         prefetch=None,
         timeout=None,
+        score_threshold=None,
     ):
         self.query_calls.append(
             {
@@ -190,6 +191,12 @@ class FakeQdrant:
                 ]
             )
         matching = self._matching(collection_name, query_filter)
+        if score_threshold is not None:
+            # A plain (non-prefetch) query honors score_threshold on the real
+            # server too; mirror it so the pool-level floor is exercised.
+            matching = [
+                point for point in matching if point["score"] >= score_threshold
+            ]
         matching.sort(key=lambda point: -point["score"])
         matching = matching[:limit]
         return SimpleNamespace(
@@ -547,6 +554,41 @@ def test_search_respects_top_k() -> None:
 
     assert [hit.page for hit in hits] == [1, 2]
     assert fake.query_calls[0]["limit"] == 2
+
+
+def test_hybrid_requires_dense_backing_above_the_floor() -> None:
+    """The text branch is a recall aid, not independent evidence (ADR-004).
+
+    A token-only match whose dense score sits below MIN_SCORE must NOT become
+    evidence: the pool stays empty so the caller refuses without an LLM call.
+    """
+    from plant_rag.retrieve.hybrid import hybrid_search
+
+    fake = FakeQdrant()
+    fake.alias("current_text", "manual_r1_text")
+    fake.seed(
+        "manual_r1_text",
+        text_payload(page=1, child_text="presion neumaticos tire pressure"),
+        scores=[0.10],  # below MIN_SCORE: not dense-backed
+    )
+
+    assert hybrid_search(fake, query_vector(), "presion neumaticos") == ()
+
+
+def test_hybrid_fuses_when_the_dense_branch_has_above_floor_evidence() -> None:
+    from plant_rag.retrieve.hybrid import hybrid_search
+
+    fake = FakeQdrant()
+    fake.alias("current_text", "manual_r1_text")
+    fake.seed(
+        "manual_r1_text",
+        text_payload(page=7, child_text="presion neumaticos tire pressure"),
+        scores=[0.9],
+    )
+
+    hits = hybrid_search(fake, query_vector(), "presion neumaticos")
+
+    assert [hit.page for hit in hits] == [7]
     assert config.TOP_K == 5  # default keeps prompts inside the 8k context
 
 
@@ -758,3 +800,128 @@ def test_alias_and_naming_contract_shared_with_ingestion() -> None:
     assert current_target(fake, store.TEXT_ALIAS) is None
     fake.alias("current_text", "manual_r3_text")
     assert current_target(fake, store.TEXT_ALIAS) == "manual_r3_text"
+
+
+# --- CPU cross-encoder: ordering, degradation, boundary (injected scorer) ---
+
+
+def _hits(pages: tuple[int, ...]) -> tuple:
+    from plant_rag.models import Hit
+
+    return tuple(
+        Hit(manual_id="M", page=p, revision="r1", child=f"c{p}", parent=f"p{p}")
+        for p in pages
+    )
+
+
+def _scores_in_order(values: list[float]):
+    """A scorer that hands back ``values`` in call order, recording pairs."""
+
+    def score(pairs: list[tuple[str, str]]) -> list[float]:
+        return values
+
+    return score
+
+
+def test_rerank_orders_by_score_and_cuts_to_top_k() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    hits = _hits((10, 20, 30, 40, 50, 60))
+    ordered = rerank("pregunta", hits, top_k=3, scorer=_scores_in_order([0.1, 0.9, 0.5, 0.3, 0.8, 0.2]))
+
+    assert [h.page for h in ordered] == [20, 50, 30]
+
+
+def test_rerank_resolves_ties_in_incoming_order() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    hits = _hits((10, 20, 30))
+    ordered = rerank("pregunta", hits, top_k=3, scorer=_scores_in_order([0.5, 0.5, 0.5]))
+
+    assert [h.page for h in ordered] == [10, 20, 30]  # stable: retrieval order
+
+
+def test_rerank_with_an_empty_pool_never_loads_the_scorer() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    def exploding_scorer(pairs):
+        raise AssertionError("an empty pool must not load the cross-encoder")
+
+    assert rerank("pregunta", (), top_k=5, scorer=exploding_scorer) == ()
+
+
+def test_rerank_warmup_scores_one_throwaway_pair() -> None:
+    from plant_rag.retrieve.rerank import warmup
+
+    seen: list[list[tuple[str, str]]] = []
+
+    def scorer(pairs):
+        seen.append(list(pairs))
+        return [0.0] * len(pairs)
+
+    assert warmup(scorer=scorer) is True
+    assert len(seen) == 1 and len(seen[0]) == 1
+
+
+def test_rerank_warmup_reports_failure_instead_of_pretending_success() -> None:
+    # ``rerank`` degrades to the incoming order when the model fails, so warm-up
+    # cannot infer success from it: it must call the scorer itself.
+    from plant_rag.retrieve.rerank import warmup
+
+    def broken_scorer(pairs):
+        raise RuntimeError("weights missing")
+
+    assert warmup(scorer=broken_scorer) is False
+
+
+def test_rerank_warmup_with_reranking_disabled_does_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plant_rag.retrieve.rerank import warmup
+
+    monkeypatch.setattr(config, "RERANK_MODEL", "")
+
+    assert warmup() is False
+
+
+def test_rerank_keeps_retrieval_order_when_scoring_fails() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    def broken_scorer(pairs):
+        raise RuntimeError("scoring failed")
+
+    hits = _hits((10, 20, 30))
+    kept = rerank("pregunta", hits, top_k=2, scorer=broken_scorer)
+
+    assert [h.page for h in kept] == [10, 20]  # degraded, never loud
+
+
+def test_rerank_keeps_retrieval_order_when_the_model_cannot_load(
+    monkeypatch,
+) -> None:
+    from plant_rag.retrieve import rerank as rerank_mod
+
+    def unavailable():
+        raise OSError("weights not on disk")
+
+    monkeypatch.setattr(rerank_mod, "_default_scorer", unavailable)
+    hits = _hits((10, 20, 30))
+
+    assert [h.page for h in rerank_mod.rerank("pregunta", hits, top_k=2)] == [10, 20]
+
+
+def test_rerank_rejects_a_score_count_that_does_not_match_the_pool() -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    with pytest.raises(ValueError, match="scores"):
+        rerank("pregunta", _hits((10, 20)), top_k=2, scorer=_scores_in_order([0.5]))
+
+
+def test_rerank_without_a_configured_model_truncates_in_order(monkeypatch) -> None:
+    from plant_rag import config
+    from plant_rag.retrieve.rerank import rerank
+
+    monkeypatch.setattr(config, "RERANK_MODEL", "")
+    hits = _hits((10, 20, 30))
+
+    assert [h.page for h in rerank("pregunta", hits, top_k=2)] == [10, 20]

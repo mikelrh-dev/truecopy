@@ -177,12 +177,56 @@ def test_owner_upload_starts_ingestion_with_spanish_progress(
     staged_path = Path(args[0])
     assert staged_path.parent == tmp_path
     assert staged_path.suffix == ".pdf"
-    assert kwargs["manual_id"] == "manual-actual"
+    # The manual's own filename is the identity (audit A1): the same
+    # namespace the CLI uses, so goldens and calibration records match.
+    assert kwargs["manual_id"] == "manual"
 
     assert st.status.call_args.args[0] == OWNER_UPLOAD_IN_PROGRESS
     status.update.assert_called_once()
     assert OWNER_UPLOAD_DONE in status.update.call_args.kwargs["label"]
     st.success.assert_called_once_with(OWNER_UPLOAD_DONE)
+
+
+def test_two_different_uploads_get_two_different_manual_ids(
+    store: auth.AuthStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Identity is the manual's name, never one shared bucket (audit A1).
+
+    With the old ``"manual-actual"`` id, a calibration record measured for
+    one manual was served as the suggestion for a different one.
+    """
+    real_stage = webapp._stage_upload
+    monkeypatch.setattr(webapp, "_stage_upload", lambda data: real_stage(data, tmp_path))
+    st, _ = _stub_st(monkeypatch)
+    run_reindex = MagicMock(return_value=SimpleNamespace(revision=7))
+    monkeypatch.setattr(reindex_mod, "run_reindex", run_reindex)
+    monkeypatch.setattr(qdrant_client, "QdrantClient", MagicMock())
+    monkeypatch.setattr(embedder_mod, "get_embedder", MagicMock())
+
+    webapp._do_upload(_FakeUpload(name="manual de calidad.pdf"))
+    webapp._do_upload(_FakeUpload(name="manual de seguridad.pdf"))
+
+    ids = [call.kwargs["manual_id"] for call in run_reindex.call_args_list]
+    assert ids == ["manual_de_calidad", "manual_de_seguridad"]
+
+
+def test_the_uploaded_filename_never_reaches_the_staged_path(
+    store: auth.AuthStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """UUID staging still holds: the name carries identity, not the path."""
+    real_stage = webapp._stage_upload
+    monkeypatch.setattr(webapp, "_stage_upload", lambda data: real_stage(data, tmp_path))
+    st, _ = _stub_st(monkeypatch)
+    run_reindex = MagicMock(return_value=SimpleNamespace(revision=7))
+    monkeypatch.setattr(reindex_mod, "run_reindex", run_reindex)
+    monkeypatch.setattr(qdrant_client, "QdrantClient", MagicMock())
+    monkeypatch.setattr(embedder_mod, "get_embedder", MagicMock())
+
+    webapp._do_upload(_FakeUpload(name="../../etc/passwd.pdf"))
+
+    staged = Path(run_reindex.call_args.args[0])
+    assert staged.parent == tmp_path  # traversal never escapes staging
+    assert "passwd" in run_reindex.call_args.kwargs["manual_id"]
 
 
 def test_owner_upload_failure_reports_the_spanish_error(

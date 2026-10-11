@@ -104,6 +104,35 @@ def post_chat(url: str, payload: dict, timeout_s: float) -> dict:
     return decoded
 
 
+def warmup(*, transport: Transport = post_chat, timeout_s: float = 120.0) -> bool:
+    """Load ``config.OLLAMA_MODEL`` before the first operator question.
+
+    A cold qwen2.5:7b load costs ~15-20s and lands on whoever asks first,
+    inside the same 45s end-to-end budget the answer uses (ADR-005). The web
+    app calls this when it opens; one token is requested and the response is
+    discarded. Best-effort by design: it NEVER raises, because a failed warm-up
+    must not stop the app from serving — the first real question then pays the
+    load exactly as it did before. When ``config.OLLAMA_KEEP_ALIVE`` is set,
+    the request also asks Ollama to keep the model resident for that window.
+
+    Returns:
+        ``True`` when Ollama answered, ``False`` on any failure.
+    """
+    payload: dict = {
+        "model": config.OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": "ok"}],
+        "stream": False,
+        "options": {"num_predict": 1},
+    }
+    if config.OLLAMA_KEEP_ALIVE.strip():
+        payload["keep_alive"] = config.OLLAMA_KEEP_ALIVE
+    try:
+        transport(f"{config.OLLAMA_URL}/api/chat", payload, timeout_s)
+    except Exception:  # noqa: BLE001 - a warm-up failure is never fatal
+        return False
+    return True
+
+
 def _extract_content(response: dict) -> str:
     """Read the assistant message out of an Ollama chat response, or fail."""
     message = response.get("message")
@@ -266,7 +295,11 @@ def generate(
             except DeadlineExceeded:
                 return Answer(kind="refusal", text_es=REFUSAL_ES, citations=())
             if _is_refusal_text(text):
-                # Second decline: the retry answer is also a refusal.
+                # Second decline: the retry answer is also a refusal. The
+                # pool is unchanged, so this is a decline-strong-pool event
+                # too - the model declined twice next to full evidence.
+                if decline_signal is not None and _full_pool(hits):
+                    decline_signal(question, hits)
                 return Answer(kind="refusal", text_es=REFUSAL_ES, citations=())
             try:
                 citations = validate_citations(text, hits)

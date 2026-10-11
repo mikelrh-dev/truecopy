@@ -92,14 +92,16 @@ src/plant_rag/
   models.py            Hit, Citation, Answer, REFUSAL_ES, TIMEOUT_ES
   ingest/              loader, chunker, alarms, reindex (azul/verde)
   retrieve/            expand, embedder, hybrid, rerank, fastpath, store
-  answer/              pipeline, prompt, citations, llm
+  answer/              pipeline, prompt, citations, llm, cache
   scheduling/          scheduler (cola prioritaria)
-  monitoring.py        log JSONL + estadísticas
+  monitoring.py        log JSONL (respuestas + eventos) y estadísticas
+  calibration.py       registros de suelo por manual (eval informa, owner aplica)
 web/                   app.py (UI + scheduler compartido), auth.py, ui_es.py
-scripts/               ingest, reindex, query, run_web, eval
-tests/                 229 tests, todos herméticos (sin Qdrant ni Ollama)
-docs/                  README (operación), TUTORIAL (puesta en marcha),
-                       COMO-DECLINE-EL-SISTEMA (seguridad), este documento
+scripts/               ingest, reindex, query, run_web, eval, feedback_report
+tests/                 362 tests, todos herméticos (sin Qdrant ni Ollama)
+raíz                   README (operación), TUTORIAL (puesta en marcha),
+                       COMO-DECLINE-EL-SISTEMA (seguridad), ROADMAP (pendientes),
+                       este documento
 ```
 
 ---

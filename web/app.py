@@ -22,10 +22,10 @@ Conventions established here:
 
 from __future__ import annotations
 
-import io
 import time
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import streamlit as st
 
@@ -33,6 +33,9 @@ from plant_rag import config
 from plant_rag.answer.llm import LLMError
 from plant_rag.models import Answer
 from plant_rag.scheduling.scheduler import Scheduler, queue_position_es
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from plant_rag.monitoring import QueryLog
 
 from web import auth
 from web.ui_es import (
@@ -45,6 +48,7 @@ from web.ui_es import (
     LOGIN_PASSWORD_LABEL,
     LOGIN_SUBMIT,
     LOGIN_TITLE,
+    PREWARM_LABEL,
     OWNER_CODE_ADD,
     OWNER_CODE_ADD_DONE,
     OWNER_CODE_ADD_DUPLICATE,
@@ -60,7 +64,6 @@ from web.ui_es import (
     OWNER_IS_OPERATOR,
     OWNER_IS_OWNER,
     OWNER_LOGOUT,
-    OWNER_REINDEX_DONE,
     OWNER_REINDEX_FAILED,
     OWNER_REINDEX_HELP,
     OWNER_REINDEX_IN_PROGRESS,
@@ -142,8 +145,8 @@ def _set_current_user(user: auth.User | None) -> None:
 def _page_login() -> None:
     st.title(LOGIN_TITLE)
 
-    code = st.text_input(LOGIN_CODE_LABEL, key="login_code")
-    password = st.text_input(LOGIN_PASSWORD_LABEL, type="password", key="login_password")
+    st.text_input(LOGIN_CODE_LABEL, key="login_code")
+    st.text_input(LOGIN_PASSWORD_LABEL, type="password", key="login_password")
     submit = st.button(LOGIN_SUBMIT, type="primary")
 
     if submit:
@@ -259,7 +262,7 @@ def _owner_upload() -> None:
 
 def _do_upload(uploaded) -> None:
     from plant_rag import config
-    from plant_rag.ingest.reindex import run_reindex
+    from plant_rag.ingest.reindex import manual_id_from_filename, run_reindex
     from plant_rag.retrieve.embedder import get_embedder
     from qdrant_client import QdrantClient
 
@@ -267,7 +270,11 @@ def _do_upload(uploaded) -> None:
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     encode = get_embedder().encode
-    manual_id = "manual-actual"
+    # The SAME identity namespace as the CLI: the manual's own filename.
+    # A single shared id for every web upload used to collide — goldens
+    # never matched and calibration records from different manuals
+    # overwrote each other (audit A1).
+    manual_id = manual_id_from_filename(uploaded.name)
 
     try:
         with st.status(OWNER_UPLOAD_IN_PROGRESS, expanded=True) as status:
@@ -297,37 +304,18 @@ def _owner_reindex() -> None:
 
 
 def _do_reindex() -> None:
-    from plant_rag import config
-    from plant_rag.ingest.reindex import run_reindex
-    from plant_rag.retrieve.embedder import get_embedder
-    from qdrant_client import QdrantClient
-
-    # Reindex without a new PDF: the CLI ``scripts/reindex.py`` does this when
-    # the owner runs it explicitly; the web button triggers the same pipeline
-    # against the currently ingested manual so the operator can rebuild after
-    # config tweaks / alias repairs without re-uploading a PDF.
-    try:
-        client = QdrantClient(url=config.QDRANT_URL, timeout=60)
-        encode = get_embedder().encode
-        current = client.get_collections()
-        manual_id = "manual-actual"
-
-        with st.status(OWNER_REINDEX_IN_PROGRESS, expanded=True) as status:
-            status.write(OWNER_REINDEX_IN_PROGRESS)
-            status.write("Reindexación manual iniciada…")
-            # NOTE: run_reindex requires a PDF path; for a manual-only reindex
-            # the operator must use scripts/reindex.py. This button is a
-            # no-op guard that points the operator at the right tool.
-            status.update(
-                label=OWNER_REINDEX_FAILED,
-                state="error",
-            )
-            st.warning(
-                "La reindexación desde la web requiere un PDF nuevo. "
-                "Use scripts/reindex.py para reconstruir el índice actual."
-            )
-    except Exception as exc:
-        st.error(f"{OWNER_REINDEX_FAILED}: {exc}")
+    # Reindex without a new PDF is a CLI operation (``scripts/reindex.py``:
+    # rebuild the current manual after config tweaks / alias repairs). The web
+    # button cannot perform it and only points the operator at the right tool,
+    # so it opens no connection and touches no state.
+    with st.status(OWNER_REINDEX_IN_PROGRESS, expanded=True) as status:
+        status.write(OWNER_REINDEX_IN_PROGRESS)
+        status.write("Reindexación manual iniciada…")
+        status.update(label=OWNER_REINDEX_FAILED, state="error")
+        st.warning(
+            "La reindexación desde la web requiere un PDF nuevo. "
+            "Use scripts/reindex.py para reconstruir el índice actual."
+        )
 
 
 def _owner_codes(user: auth.User) -> None:
@@ -488,7 +476,7 @@ def _page_question() -> None:
         except LLMError:
             st.error(f"{ANSWER_INFRA_ERROR_LABEL}: {ANSWER_INFRA_ERROR_PROMPT}")
             answer = None
-        except Exception as exc:
+        except Exception:
             st.error(f"{ANSWER_INFRA_ERROR_LABEL}: {ANSWER_INFRA_ERROR_PROMPT}")
             answer = None
         finally:
@@ -558,14 +546,16 @@ def _generate_and_record(question: str, remaining_s: float) -> Answer:
     identical answers (the corpus is the same for everyone).
     """
     from plant_rag.answer.pipeline import answer_question
-    from plant_rag.monitoring import QueryLog
 
     answer = answer_question(
         question, remaining_s, log=_query_log(), cache=_answer_cache()
     )
-    if len(_ANSWERS) > 1000:  # bounded: a console runs for days, not forever
-        _ANSWERS.clear()
+    # Bounded: a console runs for days. Evict the OLDEST entries (dicts are
+    # insertion-ordered) instead of clearing the map — a clear could drop
+    # another session's answer that is still in flight.
     _ANSWERS[question] = answer
+    while len(_ANSWERS) > 1000:
+        _ANSWERS.pop(next(iter(_ANSWERS)))
     return answer
 
 
@@ -654,20 +644,22 @@ def _run_question(
             answer = _ANSWERS.get(question)
             if answer is not None:
                 break
-            time.sleep(0.5)
+            time.sleep(0.25)
 
     if answer is not None:
         _record_metrics(answer)
     return answer
 
 
-def _cited_excerpts(citations: tuple) -> dict[tuple[str, int], str]:
-    """Fetch the manual passage behind each citation from the live corpus.
+def _cited_page_payloads(citations: tuple) -> dict[tuple[str, int], dict]:
+    """Fetch the passage payload behind each citation from the live corpus.
 
     One scroll over the current revision, filtered to the cited pages: the
-    operator verifies the answer without opening the PDF. A failure (Qdrant
-    down, alias missing) returns an empty map — the excerpt is a trust aid,
-    never a requirement for showing the answer.
+    operator verifies the answer without opening the PDF. Returns the parent
+    text, the corpus revision, and the page's ``has_figures`` flag so the
+    render can show the saved figure beside the excerpt when one exists. A
+    failure (Qdrant down, alias missing) returns an empty map — verification
+    aids are never a reason to withhold the answer.
     """
     if not citations:
         return {}
@@ -703,16 +695,54 @@ def _cited_excerpts(citations: tuple) -> dict[tuple[str, int], str]:
             with_payload=True,
             with_vectors=False,
         )
-        excerpts: dict[tuple[str, int], str] = {}
+        payloads: dict[tuple[str, int], dict] = {}
         for point in points:
             payload = point.payload or {}
             key = (str(payload.get("manual_id", "")), int(payload.get("page", 0)))
-            text = str(payload.get("parent_text", "")).strip()
-            if text and key not in excerpts:
-                excerpts[key] = text
-        return excerpts
+            if key not in payloads:
+                payloads[key] = {
+                    "text": str(payload.get("parent_text", "")).strip(),
+                    "revision": str(payload.get("revision", "")).strip(),
+                    "has_figures": bool(payload.get("has_figures", False)),
+                }
+        return payloads
     except Exception:
         return {}
+
+
+def _cited_excerpts(citations: tuple) -> dict[tuple[str, int], str]:
+    """The parent text behind each citation (thin wrapper over the payloads)."""
+    return {
+        key: meta["text"]
+        for key, meta in _cited_page_payloads(citations).items()
+        if meta["text"]
+    }
+
+
+def _cited_figure(citation, meta: dict):
+    """The saved figure path for one cited page, or ``None`` when there is none.
+
+    The figure is a trust aid appended BESIDE the excerpt, never part of the
+    answer contract: it shows only when the page was flagged at ingest AND the
+    file exists on disk. Any failure (disabled dir, missing file) degrades to
+    the text excerpt alone.
+    """
+    if not meta.get("has_figures"):
+        return None
+    try:
+        if not str(config.FIGURES_DIR).strip():
+            return None
+        from plant_rag.ingest.figures import figure_path
+
+        path = figure_path(
+            config.FIGURES_DIR,
+            meta.get("revision", ""),
+            citation.manual_id,
+            citation.page,
+        )
+        return path if path.is_file() else None
+    except Exception:  # noqa: BLE001 - a missing figure never breaks the render
+        return None
 
 
 def _render_answer(answer: Answer | None) -> None:
@@ -739,7 +769,7 @@ def _render_answer(answer: Answer | None) -> None:
 
     if answer.citations:
         st.subheader(ANSWER_CITATIONS_LABEL)
-        excerpts = _cited_excerpts(answer.citations)
+        payloads = _cited_page_payloads(answer.citations)
         seen: set[tuple[str, int]] = set()
         for citation in answer.citations:
             key = (citation.manual_id, citation.page)
@@ -747,12 +777,16 @@ def _render_answer(answer: Answer | None) -> None:
                 continue  # the answer often cites the same page per step
             seen.add(key)
             st.caption(f"[Fuente: {citation.manual_id} Página {citation.page}]")
-            excerpt = excerpts.get(key)
+            meta = payloads.get(key)
+            excerpt = meta["text"] if meta else None
             if excerpt:
                 with st.expander(
                     f"{ANSWER_EXCERPT_LABEL} {citation.page}", expanded=False
                 ):
                     st.text(excerpt[:2000])
+                    figure = _cited_figure(citation, meta)
+                    if figure is not None:
+                        st.image(str(figure), caption=f"Página {citation.page}")
 
 
 def _feedback_widget(answer: Answer | None) -> None:
@@ -814,8 +848,46 @@ def _cast_feedback(answer: Answer, vote: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def prewarm_models() -> dict[str, bool]:
+    """Load the three heavy models, once, before the first operator question.
+
+    A cold start costs ~35-40s (BGE-M3 ~12s + reranker ~8s + qwen2.5 load
+    ~15-20s) and it lands on whoever asks first, inside the same 45s budget the
+    answer uses (ADR-005). Best-effort by design: a failed warm-up is reported
+    for the server console and the app serves anyway — the first question then
+    pays that load exactly as it did before.
+
+    Disabled by ``PLANT_RAG_PREWARM_MODELS=0`` (the hermetic suite sets it, so
+    driving the real app through AppTest never loads a checkpoint or calls
+    Ollama). Returns the per-model readiness map, empty when disabled.
+    """
+    if not config.PREWARM_MODELS:
+        return {}
+
+    from plant_rag.answer import llm as llm_mod
+    from plant_rag.retrieve import rerank as rerank_mod
+    from plant_rag.retrieve.embedder import get_embedder
+
+    ready: dict[str, bool] = {}
+    try:
+        get_embedder().encode(["calentamiento"])
+        ready["embedder"] = True
+    except Exception:  # noqa: BLE001 - warm-up must never block the app
+        ready["embedder"] = False
+    ready["reranker"] = rerank_mod.warmup()
+    ready["llm"] = llm_mod.warmup()
+    return ready
+
+
+@st.cache_resource(show_spinner=PREWARM_LABEL)
+def _prewarm_models() -> dict[str, bool]:
+    """Once per process: Streamlit reruns this file on every interaction."""
+    return prewarm_models()
+
+
 def main() -> None:
     """Login gate first, then the app page for the session's user."""
+    _prewarm_models()
     if _current_user() is None:
         _page_login()
     else:

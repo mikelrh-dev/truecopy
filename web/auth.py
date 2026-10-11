@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -111,8 +113,11 @@ class AuthStore:
         code = code.strip()
         if not code:
             raise ValueError("El código no puede estar vacío")
-        password = password.strip()
-        if not password:
+        # Validate emptiness on the trimmed form, but verify the EXACT string
+        # ``add_user`` hashed: surrounding spaces are part of the secret. The
+        # previous asymmetry (hash raw, verify stripped) made any account whose
+        # password had leading/trailing whitespace impossible to log into.
+        if not password.strip():
             raise ValueError("La contraseña no puede estar vacía")
 
         record = self._users.get(code)
@@ -218,18 +223,30 @@ class WrongPasswordError(Exception):
         super().__init__(message)
 
 
-def create_default_users(path: Path | None = None) -> AuthStore:
+def create_default_users(
+    path: Path | None = None, *, password: str | None = None
+) -> AuthStore:
     """Create a store with one owner account on first boot if none exist.
 
-    This is an operator setup helper, not authentication itself. The default
-    credentials are deliberately ugly and printed only once so they can be
-    retired immediately; in production the owner re-sets them from the UI.
+    This is an operator setup helper, not authentication itself. The owner
+    password is RANDOM per install (``secrets.token_urlsafe``) and printed
+    ONCE to the server console, so no fixed credential ships in the source and
+    nothing predictable can be guessed before the owner rotates it. ``password``
+    is injectable for tests.
     """
     store = AuthStore(path)
     if store.list_codes():
         return store
 
     owner_code = "admin"
-    owner_password = "admin-early-boot-owner"
+    owner_password = password or secrets.token_urlsafe(16)
     store.add_user(owner_code, owner_password, owner=True)
+    print(
+        f"TrueCopy: owner creado — código '{owner_code}', contraseña: "
+        f"{owner_password}",
+        file=sys.stderr,
+    )
+    print(
+        "Cámbiela en la UI (Owner > Códigos) antes de operar.", file=sys.stderr
+    )
     return store

@@ -278,9 +278,21 @@ class QueryLog:
 
 
 def build_record(
-    question: str, answer: Answer, latency_s: float, *, model: str
+    question: str,
+    answer: Answer,
+    latency_s: float,
+    *,
+    model: str,
+    revision: str = "",
 ) -> QueryRecord:
-    """The record for one answer: provenance from its citations, no content."""
+    """The record for one answer: provenance from its citations, no content.
+
+    ``revision`` is the corpus revision that produced the answer (``"r3"``).
+    It defaults to the empty string so a caller that cannot know it keeps the
+    historical shape; the answering chain always knows it and passes it, which
+    is what lets the log answer "which corpus did this come from" after a
+    reindex - the same provenance the calibration advisory warns about.
+    """
     pages = tuple(
         dict.fromkeys(
             citation.page
@@ -295,7 +307,7 @@ def build_record(
         latency_s=round(latency_s, 3),
         pages=pages,
         manual_id=manual_id,
-        revision="",
+        revision=revision,
         model=model,
     )
 

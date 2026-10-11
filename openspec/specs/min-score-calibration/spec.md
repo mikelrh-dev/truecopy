@@ -70,7 +70,7 @@ Staleness SHALL be: revision mismatch or label-total drift hard stale; age over 
 
 ### Requirement: Verbatim identifier keys
 
-Records SHALL key on the ingested id verbatim; CLI PDF-stem and web `manual-actual` are separate keys. A miss MUST fail clean to "no record" and MUST NOT fuzzy-match to a similar key.
+Records SHALL key on the ingested id verbatim. There is ONE identity namespace — the sanitized filename — shared by the CLI entrypoints and the web upload, so a manual ingested from the web and the same manual ingested from the CLI key on the same id (the previous split where the web used `manual-actual` is removed). A miss MUST fail clean to "no record" and MUST NOT fuzzy-match to a similar key.
 
 #### Scenario: Key miss
 
@@ -78,15 +78,21 @@ Records SHALL key on the ingested id verbatim; CLI PDF-stem and web `manual-actu
 - WHEN a suggestion is requested
 - THEN "no record" is reported for that id only
 
-### Requirement: Dense-only floor documented
+#### Scenario: Web and CLI share the key
 
-Calibration documentation SHALL state the recommended floor applies to the dense branch only; the text branch stays ungated (full-text scores are not cosine scores).
+- GIVEN a manual ingested from the web under its filename-derived id
+- WHEN the CLI ingests the same manual
+- THEN both resolve to the same id and the same calibration record
+
+### Requirement: Floor scope and sweep path documented
+
+Calibration documentation SHALL state that the recommended floor scores the dense branch (full-text scores are not cosine scores) and that the retrieval pool is empty without at least one above-floor dense candidate (the text branch is a recall aid, never independent evidence). The sweep SHALL probe the SERVING path — the same ES→EN expansion and hybrid pool builder that answers operators — not a dense-only search.
 
 #### Scenario: Documented scope
 
 - GIVEN the calibration module documentation
 - WHEN it describes the recommended floor
-- THEN it states dense-branch-only scope and an ungated text branch
+- THEN it states dense-branch scoring, the pool-level gate, and that the sweep measures the serving path
 
 ### Requirement: Serving non-participation
 
@@ -106,7 +112,7 @@ Calibration records MUST never participate in serving threshold resolution; prec
 
 ### Requirement: Suggestion content contract
 
-Every suggestion line MUST carry recommended and current floor, revision, record date, golden pass/total counts, staleness label, and wording "separates this labeled set" (never "optimal"). A differing recommendation MUST include the answer-cache wipe instruction. Suggestions MUST NOT write to config, store, or index.
+Every suggestion line MUST carry recommended and current floor, revision, record date, golden pass/total counts, staleness label, and wording "separates this labeled set" (never "optimal"). A differing recommendation MUST state the env override to apply and that prior cached answers stop being served on their own (the cache key carries a config fingerprint; no manual wipe is required). Suggestions MUST NOT write to config, store, or index.
 
 #### Scenario: Fresh record suggestion
 

@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from plant_rag import config
-from web import auth
+from web import app, auth
 from web.ui_es import (
     ANSWER_LABEL,
     ANSWER_TIMEOUT_LABEL,
@@ -105,6 +105,93 @@ def test_authenticate_same_error_for_unknown_code_and_wrong_password(tmp_path: P
         store.authenticate("noexiste", "secreto-123")
     with pytest.raises(auth.WrongPasswordError, match="incorrectos"):
         store.authenticate("op1", "secreto-456")
+
+
+def test_authenticate_accepts_a_password_with_surrounding_spaces(
+    tmp_path: Path,
+) -> None:
+    """Regression: hashing raw but verifying stripped locked such accounts out."""
+    store = make_store(tmp_path)
+    add_user(store, "op1", "  con espacios  ", owner=False)
+
+    assert store.authenticate("op1", "  con espacios  ").code == "op1"
+    # The trimmed form is a different secret, not an accepted alias.
+    with pytest.raises(auth.WrongPasswordError):
+        store.authenticate("op1", "con espacios")
+
+
+def test_create_default_users_generates_a_random_owner_password(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No fixed default credential ships in the source any more."""
+    store = auth.create_default_users(tmp_path / "users.json")
+
+    assert store.list_codes() == ["admin"]
+    assert store.owner("admin") is not None
+    err = capsys.readouterr().err
+    assert "admin" in err and "contraseña" in err  # printed once, to rotate it
+    with pytest.raises(auth.WrongPasswordError):
+        store.authenticate("admin", "admin-early-boot-owner")
+
+
+def test_create_default_users_is_idempotent(tmp_path: Path) -> None:
+    """A second boot never resets an existing owner."""
+    auth.create_default_users(tmp_path / "users.json", password="elegida-por-test")
+    again = auth.create_default_users(tmp_path / "users.json")
+
+    assert again.list_codes() == ["admin"]
+    assert again.authenticate("admin", "elegida-por-test").code == "admin"
+
+
+# --- model pre-warm (first question must not pay the load) ------------------
+
+
+def test_prewarm_is_disabled_in_the_hermetic_suite() -> None:
+    """AppTest drives the real app: pre-warm must never load a model here."""
+    assert config.PREWARM_MODELS is False
+    assert app.prewarm_models() == {}
+
+
+def test_prewarm_loads_the_three_models_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import plant_rag.answer.llm as llm_mod
+    import plant_rag.retrieve.embedder as embedder_mod
+    import plant_rag.retrieve.rerank as rerank_mod
+
+    monkeypatch.setattr(config, "PREWARM_MODELS", True)
+    loaded: list[str] = []
+
+    class FakeEmbedder:
+        def encode(self, texts):
+            loaded.append("embedder")
+            return [[0.0] * config.EMBED_DIMS for _ in texts]
+
+    monkeypatch.setattr(embedder_mod, "get_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(rerank_mod, "warmup", lambda: loaded.append("reranker") or True)
+    monkeypatch.setattr(llm_mod, "warmup", lambda: loaded.append("llm") or True)
+
+    assert app.prewarm_models() == {"embedder": True, "reranker": True, "llm": True}
+    assert loaded == ["embedder", "reranker", "llm"]
+
+
+def test_prewarm_never_blocks_the_app_when_a_model_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import plant_rag.answer.llm as llm_mod
+    import plant_rag.retrieve.embedder as embedder_mod
+    import plant_rag.retrieve.rerank as rerank_mod
+
+    monkeypatch.setattr(config, "PREWARM_MODELS", True)
+
+    def broken_embedder():
+        raise RuntimeError("weights missing")
+
+    monkeypatch.setattr(embedder_mod, "get_embedder", broken_embedder)
+    monkeypatch.setattr(rerank_mod, "warmup", lambda: False)
+    monkeypatch.setattr(llm_mod, "warmup", lambda: False)
+
+    assert app.prewarm_models() == {"embedder": False, "reranker": False, "llm": False}
 
 
 def test_owner_lookup_returns_user_only_for_owner(tmp_path: Path) -> None:
@@ -453,6 +540,52 @@ def test_cited_excerpts_fail_open_when_the_corpus_is_unreachable(
 
     # An excerpt is a trust aid: never a reason to withhold the answer.
     assert web_app._cited_excerpts(answer.citations) == {}
+
+
+def test_cited_page_payloads_expose_the_revision_and_figure_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web import app as web_app
+
+    client = _FakeScrollClient(
+        [
+            {"manual_id": "M", "page": 98, "parent_text": "t", "revision": "r3", "has_figures": True},
+            {"manual_id": "M", "page": 39, "parent_text": "u", "revision": "r3"},
+        ]
+    )
+    monkeypatch.setattr(
+        "qdrant_client.QdrantClient", lambda *a, **kw: client, raising=True
+    )
+    from plant_rag.models import Citation
+
+    payloads = web_app._cited_page_payloads((Citation("M", 98), Citation("M", 39)))
+
+    assert payloads[("M", 98)]["has_figures"] is True
+    assert payloads[("M", 39)]["has_figures"] is False
+    assert payloads[("M", 98)]["revision"] == "r3"
+
+
+def test_cited_figure_returns_the_file_only_when_it_exists(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plant_rag import config
+    from plant_rag.ingest.figures import figure_path
+    from plant_rag.models import Citation
+    from web import app as web_app
+
+    monkeypatch.setattr(config, "FIGURES_DIR", str(tmp_path))
+    meta = {"text": "t", "revision": "r3", "has_figures": True}
+    citation = Citation("M", 98)
+
+    assert web_app._cited_figure(citation, meta) is None  # flagged but absent
+
+    target = figure_path(config.FIGURES_DIR, "r3", "M", 98)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"png")
+
+    assert web_app._cited_figure(citation, meta) == target
+    # A page without the flag never looks for a file.
+    assert web_app._cited_figure(citation, {"has_figures": False}) is None
 
 
 # ---------------------------------------------------------------------------

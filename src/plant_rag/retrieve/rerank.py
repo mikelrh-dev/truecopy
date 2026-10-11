@@ -109,3 +109,31 @@ def rerank(
     scores = [float(value) for value in raw_scores]
     order = sorted(range(len(hits)), key=lambda index: (-scores[index], index))
     return tuple(hits[index] for index in order[:top_k])
+
+
+def warmup(*, scorer: Scorer | None = None) -> bool:
+    """Load the cross-encoder weights before the first operator question.
+
+    The reranker is ~2GB and its load lands on whoever asks first, so the web
+    app calls this when it opens. It scores one throwaway pair rather than
+    calling :func:`rerank`, because ``rerank`` degrades to the incoming order
+    when the model fails — which would report a false success here. Empty
+    ``config.RERANK_MODEL`` (reranking disabled) warms nothing.
+
+    Returns:
+        ``True`` when a scoring call ran, ``False`` when reranking is disabled
+        or the model could not be loaded. Never raises.
+    """
+    if scorer is None and not config.RERANK_MODEL:
+        return False
+    active = scorer
+    if active is None:
+        try:
+            active = _default_scorer()
+        except Exception:  # noqa: BLE001 - warm-up is opportunistic
+            return False
+    try:
+        active([("calentamiento", "calentamiento")])
+    except Exception:  # noqa: BLE001 - availability over precision, as rerank
+        return False
+    return True

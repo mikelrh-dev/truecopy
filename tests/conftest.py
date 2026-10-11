@@ -7,8 +7,9 @@ would otherwise load real checkpoints:
   BGE-M3 costs seconds and ~2.5GB of RAM (ADR-002); a suite that must run
   offline and fast cannot pay that per session.
 * ``pipeline.rerank`` -> a retrieval-order cut to ``top_k``. The CPU
-  cross-encoder (~2.3GB) is exercised by ``tests/test_rerank.py`` with an
-  injected scorer and live by ``scripts/eval.py`` - never by accident here.
+  cross-encoder (~2.3GB) has its own unit coverage with an injected scorer
+  in ``tests/test_retrieve.py``; the real weights load only through the
+  live ``scripts/eval.py`` - never by accident here.
 
 Tests that need different behavior override these seams with their own
 ``monkeypatch.setattr(pipeline, ...)``; the real models stay behind the live
@@ -17,10 +18,19 @@ eval and the recorded runtime harness, not pytest.
 
 from __future__ import annotations
 
-import pytest
+import os
 
-from plant_rag import config
-from plant_rag.answer import pipeline
+# Before anything imports config: the web app's model pre-warm must stay off
+# under test. ``tests/test_owner_ops.py`` drives the real ``web/app.py`` through
+# Streamlit's AppTest, which would otherwise load BGE-M3 + the cross-encoder and
+# POST to Ollama inside the suite — breaking the hermetic rule the whole suite
+# is built on (it must pass with no services and no 2GB checkpoints).
+os.environ["PLANT_RAG_PREWARM_MODELS"] = "0"
+
+import pytest  # noqa: E402 - the env var above must be set before the import
+
+from plant_rag import config  # noqa: E402
+from plant_rag.answer import pipeline  # noqa: E402
 
 
 class FakeEmbedder:

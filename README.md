@@ -40,10 +40,15 @@ Mapa completo: [ARQUITECTURA.md](ARQUITECTURA.md).
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\python -m pytest tests -q   # 229 tests herméticos, sin servicios
+# `pip install -e .` NO basta: las dependencias de runtime viven en
+# requirements.txt (ADR-002), pyproject solo declara el paquete.
+.\.venv\Scripts\python -m pytest tests -q   # 362 tests herméticos, sin servicios
 
-docker compose up -d                          # Qdrant en 127.0.0.1:6333
+docker compose up -d                          # Qdrant en 127.0.0.1:6333 (solo loopback)
 ollama pull qwen2.5:7b-instruct               # LLM en el host (VRAM libre)
+
+# La PRIMERA consulta descarga BGE-M3 (~2 GB) y el reranker desde Hugging
+# Face: hace falta internet una vez. Después, todo es offline.
 
 # Indexar TU manual (los PDF no viajan en este repo):
 .\.venv\Scripts\python scripts/ingest.py .\documentation\tu-manual.pdf
@@ -87,7 +92,12 @@ tests/              suite hermética (sin Qdrant ni Ollama)
 ## Operación (resumen)
 
 - Servicios: Qdrant Docker + Ollama en host; todo `PLANT_RAG_*` por entorno.
-- Primer arranque: la app crea el propietario `admin` (rotarlo de inmediato);
+- Qdrant publica 6333/6334 solo en `127.0.0.1`: no trae autenticación, así que
+  exponerlo en la LAN daría acceso total al corpus saltándose el login de la
+  app. La app (Streamlit) es la única puerta para el operario.
+- Primer arranque: la app crea el propietario `admin` con una **contraseña
+  aleatoria impresa una sola vez en la consola del servidor** (no hay
+  credencial fija en el código): cópiala y cámbiala en Owner > Códigos;
   `users.json` gitignored, jamás commitear.
 - Owner: subir PDF (UUID), reindexar vía CLI, gestionar códigos.
 - Rollback por paquetes o reset total (`down -v` + borrar datos; el núcleo intacto).
