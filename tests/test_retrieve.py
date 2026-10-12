@@ -11,6 +11,7 @@ separately from this suite.
 
 from __future__ import annotations
 
+import logging
 import re
 from types import SimpleNamespace
 
@@ -225,12 +226,20 @@ class FakeQdrant:
                 "offset": offset,
             }
         )
-        matching = self._matching(collection_name, scroll_filter)[:limit]
+        # Faithful paging: the server returns up to ``limit`` rows and a
+        # next offset ONLY while rows remain. Fixtures that fit one page still
+        # see ``None`` (exhausted); a fixture larger than ``limit`` now pages
+        # like Qdrant does, which is what makes the fastpath's scan-cap
+        # truncation observable at all.
+        matching = self._matching(collection_name, scroll_filter)
+        start = int(offset) if offset is not None else 0
+        window = matching[start : start + limit]
+        next_offset = start + limit if start + limit < len(matching) else None
         records = [
             SimpleNamespace(id=point["id"], payload=point["payload"])
-            for point in matching
+            for point in window
         ]
-        return records, None  # small fixture data: one page, always exhausted
+        return records, next_offset
 
     # --- test helpers (not part of the client API) ----------------------
 
@@ -684,6 +693,79 @@ def test_alarm_lookup_never_returns_a_stale_revision() -> None:
     assert {hit.revision for hit in hits} == {"r2"}
 
 
+def test_alarm_table_capability_needs_the_alias_and_a_current_row() -> None:
+    # E3's gate hinges on this probe: "the corpus HAS an alarm table" must mean
+    # the alias resolves AND holds rows under the CURRENT revision.
+    from plant_rag.retrieve.fastpath import has_alarm_table
+
+    assert has_alarm_table(FakeQdrant()) is False  # no alias at all
+
+    empty = FakeQdrant()
+    empty.alias("current_alarms", "manual_r1_alarms")
+    assert has_alarm_table(empty) is False  # alias, but no row
+
+    seeded = FakeQdrant()
+    seeded.alias("current_alarms", "manual_r1_alarms")
+    seeded.seed("manual_r1_alarms", alarm_payload())
+    assert has_alarm_table(seeded) is True
+
+    stale = FakeQdrant()
+    stale.alias("current_alarms", "manual_r2_alarms")
+    stale.seed("manual_r2_alarms", alarm_payload(revision="r1"))
+    assert has_alarm_table(stale) is False  # rows exist, none in r2
+
+
+def _fastpath_signals(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Warnings this module emitted (ignores every other logger)."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "plant_rag.retrieve.fastpath"
+        and record.levelno >= logging.WARNING
+    ]
+
+
+def test_alarm_code_past_the_scan_cap_emits_one_truncation_signal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # E5: the cap is a bounded scan, never a silent cut. A code spanning 12
+    # pages keeps the first 10 AND says so.
+    fake = FakeQdrant()
+    fake.alias("current_alarms", "manual_r1_alarms")
+    fake.seed(
+        "manual_r1_alarms",
+        *[alarm_payload(page=page) for page in range(1, 13)],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        hits = lookup(fake, "12345")
+
+    assert hits is not None
+    assert [hit.page for hit in hits] == list(range(1, 11))  # the 10-page cap
+    signals = _fastpath_signals(caplog)
+    assert len(signals) == 1  # one signal per lookup, not one per dropped row
+    assert "12345" in signals[0]
+
+
+def test_alarm_code_exactly_at_the_scan_cap_emits_no_signal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The other half of E5: a code with exactly 10 pages and nothing after it
+    # is NOT truncated, so the signal must not cry wolf.
+    fake = FakeQdrant()
+    fake.alias("current_alarms", "manual_r1_alarms")
+    fake.seed(
+        "manual_r1_alarms",
+        *[alarm_payload(page=page) for page in range(1, 11)],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        hits = lookup(fake, "12345")
+
+    assert hits is not None and len(hits) == 10
+    assert _fastpath_signals(caplog) == []
+
+
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -848,6 +930,89 @@ def test_rerank_with_an_empty_pool_never_loads_the_scorer() -> None:
         raise AssertionError("an empty pool must not load the cross-encoder")
 
     assert rerank("pregunta", (), top_k=5, scorer=exploding_scorer) == ()
+
+
+def _rerank_signals(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Warnings the reranker emitted (ignores every other logger)."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "plant_rag.retrieve.rerank"
+        and record.levelno >= logging.WARNING
+    ]
+
+
+def test_rerank_scoring_failure_keeps_order_and_signals_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # E4/M6: the silent fallback was the blind spot. Order is unchanged; the
+    # fallback becomes observable, exactly once.
+    from plant_rag.retrieve.rerank import rerank
+
+    def broken_scorer(pairs):
+        raise RuntimeError("scoring blew up")
+
+    hits = _hits((10, 20, 30, 40))
+
+    with caplog.at_level(logging.WARNING):
+        ordered = rerank("pregunta", hits, top_k=3, scorer=broken_scorer)
+
+    assert [h.page for h in ordered] == [10, 20, 30]  # incoming order kept
+    signals = _rerank_signals(caplog)
+    assert len(signals) == 1
+    assert "scoring blew up" in signals[0]  # the cause is not swallowed
+
+
+def test_rerank_unloadable_model_keeps_order_and_signals_once(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plant_rag.retrieve import rerank as rerank_mod
+
+    def exploding_default():
+        raise OSError("weights missing")
+
+    monkeypatch.setattr(config, "RERANK_MODEL", "test-reranker")
+    monkeypatch.setattr(rerank_mod, "_default_scorer", exploding_default)
+    hits = _hits((10, 20, 30, 40))
+
+    with caplog.at_level(logging.WARNING):
+        ordered = rerank_mod.rerank("pregunta", hits, top_k=2)
+
+    assert [h.page for h in ordered] == [10, 20]
+    signals = _rerank_signals(caplog)
+    assert len(signals) == 1
+    assert "weights missing" in signals[0]
+
+
+def test_rerank_with_a_working_scorer_emits_no_signal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from plant_rag.retrieve.rerank import rerank
+
+    hits = _hits((10, 20, 30))
+
+    with caplog.at_level(logging.WARNING):
+        ordered = rerank("pregunta", hits, top_k=2, scorer=_scores_in_order([0.1, 0.9, 0.5]))
+
+    assert [h.page for h in ordered] == [20, 30]
+    assert _rerank_signals(caplog) == []
+
+
+def test_rerank_disabled_by_configuration_emits_no_signal(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Disabled on purpose is NOT a fallback: no signal, or the warning would
+    # cry wolf on every query of a deliberately rerank-free deployment.
+    from plant_rag.retrieve.rerank import rerank
+
+    monkeypatch.setattr(config, "RERANK_MODEL", "")
+    hits = _hits((10, 20, 30))
+
+    with caplog.at_level(logging.WARNING):
+        ordered = rerank("pregunta", hits, top_k=2)
+
+    assert [h.page for h in ordered] == [10, 20]
+    assert _rerank_signals(caplog) == []
 
 
 def test_rerank_warmup_scores_one_throwaway_pair() -> None:

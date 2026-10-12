@@ -32,7 +32,7 @@ from plant_rag.retrieve.store import (
     ALARMS_ALIAS,
     TEXT_ALIAS,
 )
-from test_retrieve import fuse_prefetches
+from test_retrieve import _filter_matches, fuse_prefetches
 
 # ``embed_question`` does not exist yet in the core; the integration test
 # supplies its own fake embedding so the suite stays hermetic.
@@ -156,7 +156,16 @@ class FakeQdrantClient:
     ) -> tuple[list[_Point], Any]:
         if collection_name != "manual_r1_alarms":
             return [], None
-        return list(self._alarm_points), None
+        # The filter is honored, not ignored: an alarm lookup is an EXACT
+        # match, so a double that returns every row regardless would let an
+        # unknown code "resolve" and quietly invert what the fastpath tests
+        # mean. Shares the filter emulation with test_retrieve.
+        matching = [
+            point
+            for point in self._alarm_points
+            if _filter_matches(point.payload, scroll_filter)
+        ]
+        return matching[:limit], None
 
     # ingestion surface (used by setup helpers below) -----------------------
 
@@ -309,8 +318,35 @@ def test_known_alarm_code_returns_cited_answer() -> None:
 
 
 def test_unknown_alarm_code_returns_exact_refusal() -> None:
+    # A corpus WITH an alarm table (ADR-003, untouched by the E3 gate): an
+    # unknown code refuses exactly. The text point plus an answer-ready
+    # transport are the proof that NO semantic fallback ran - had it run, this
+    # would have come back as a cited answer instead of the refusal.
     client = FakeQdrantClient()
-    scheduler = _integration_scheduler(client, FakeTransport({}))
+    client.add_alarm_point(
+        id=1,
+        manual_id="828D",
+        page=12,
+        revision="r1",
+        alarm_code="1234",
+        text="Presión de refrigerante fuera de rango.",
+    )
+    client.add_text_point(
+        id=2,
+        manual_id="828D",
+        page=5,
+        revision="r1",
+        child_text="la línea 99999 del listado",
+        parent_text="la línea 99999 del listado",
+        score=0.9,
+    )
+    transport = FakeTransport(
+        _ok_response(
+            "Aparece en la página 5 [Fuente: 828D Página 5].",
+            (Citation("828D", 5),),
+        )
+    )
+    scheduler = _integration_scheduler(client, transport)
 
     position = scheduler.submit("99999")
     answer = scheduler.run_once()
@@ -320,6 +356,37 @@ def test_unknown_alarm_code_returns_exact_refusal() -> None:
     assert answer.kind == "refusal"
     assert answer.text_es == REFUSAL_ES
     assert answer.citations == ()
+
+
+def test_digits_on_an_alarm_free_corpus_answer_semantically() -> None:
+    # E3: with no alarm table, "2024" is prose (a year, a page, an error code
+    # in a listing), never a code the corpus could have indexed. Refusing it by
+    # SHAPE is a recall failure, so the digits take the semantic path.
+    client = FakeQdrantClient()
+    client.add_text_point(
+        id=1,
+        manual_id="828D",
+        page=5,
+        revision="r1",
+        child_text="modal year 2024 procedure",
+        parent_text="modal year 2024 procedure",
+        score=0.9,
+    )
+    transport = FakeTransport(
+        _ok_response(
+            "El procedimiento de 2024 está en la página 5 [Fuente: 828D Página 5].",
+            (Citation("828D", 5),),
+        )
+    )
+    scheduler = _integration_scheduler(client, transport)
+
+    position = scheduler.submit("2024")
+    answer = scheduler.run_once()
+
+    assert position == 1
+    assert answer is not None
+    assert answer.kind == "answer"
+    assert answer.citations == (Citation("828D", 5),)
 
 
 def test_non_code_shaped_query_skips_alarm_path() -> None:

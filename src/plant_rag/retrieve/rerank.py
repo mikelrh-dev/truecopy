@@ -16,14 +16,25 @@ Conventions established here:
   cheaper and more discriminative, and the model truncates anyway.
 * The scorer is injectable: unit tests pass a deterministic double and never
   touch the network, the cache, or the weights.
+* The fallback is LOUD (E4/M6): an unloadable model or a scoring failure emits
+  one ``logging`` warning with its cause, because an operator reading unranked
+  results is running downgraded with no way to know. Disabled by CONFIGURATION
+  is not a fallback and stays silent - that would warn on every query of a
+  deliberately rerank-free deployment. No branch here ever raises a new
+  exception or changes the returned order.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 
 from plant_rag import config
 from plant_rag.models import Hit
+
+# Stdlib logging, module-scoped: observability with no new dependency and no
+# signature change (same mechanism as the fastpath scan-cap signal).
+logger = logging.getLogger(__name__)
 
 # A scorer receives (question, passage) pairs and returns one score per pair.
 Scorer = Callable[[list[tuple[str, str]]], Sequence[float]]
@@ -90,15 +101,29 @@ def rerank(
     if active_scorer is None:
         try:
             active_scorer = _default_scorer()
-        except Exception:
-            # A missing/broken model degrades ranking, never availability.
+        except Exception as exc:  # noqa: BLE001 - ranking degrades, never availability
+            # A missing/broken model degrades ranking; it must not degrade
+            # silently, or unranked results look like ranked ones forever.
+            logger.warning(
+                "rerank model %r could not be loaded (%s): keeping retrieval "
+                "order for %d candidates",
+                config.RERANK_MODEL,
+                exc,
+                len(hits),
+            )
             return tuple(hits)[:top_k]
 
     pairs = [(question, hit.child) for hit in hits]
     try:
         raw_scores = list(active_scorer(pairs))
-    except Exception:
-        # Same contract as an unavailable model: keep the incoming order.
+    except Exception as exc:  # noqa: BLE001 - ranking degrades, never availability
+        # Same contract as an unavailable model: keep the incoming order, and
+        # say so once (one warning per answer, not one per candidate).
+        logger.warning(
+            "rerank scoring failed (%s): keeping retrieval order for %d candidates",
+            exc,
+            len(hits),
+        )
         return tuple(hits)[:top_k]
 
     if len(raw_scores) != len(hits):

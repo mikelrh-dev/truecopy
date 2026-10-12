@@ -135,7 +135,19 @@ docker compose down -v     # BORRA los datos indexados (reindexar después)
 ```
 
 Ollama y Qdrant deben estar arriba antes de responder o indexar. `users.json`
-y `qdrant_data/` no se commitean nunca (están ignorados por git).
+no se commitea nunca (está ignorado por git).
+
+Los datos indexados viven en el **volumen nombrado** `ragproyect_qdrant_data`
+(no en una carpeta del repo): un bind mount de Windows perdía los vectores en
+cada reinicio — ver el apartado "Si algo falla". Copia de seguridad:
+
+```powershell
+docker run --rm -v ragproyect_qdrant_data:/d -v "$PWD":/b alpine `
+  tar czf /b/qdrant-backup.tgz -C /d .
+```
+
+La carpeta `./qdrant_data/` que puedas encontrar en el repo es legado (queda
+como evidencia/rollback de la migración del 2026-10-11); ya no la usa Qdrant.
 
 ## Si algo falla
 
@@ -147,11 +159,18 @@ y `qdrant_data/` no se commitean nunca (están ignorados por git).
 - Duda de datos → `docker compose down -v` + reingesta desde el PDF vigente
   (siempre un único manual vigente).
 - **TODAS las respuestas son "No aparece en la documentación" justo tras
-  reiniciar Docker** → los vectores en disco se pusieron a cero (el bind
-  mount de Windows pierde los mmap con un apagado sucio; los payloads
-  sobreviven, por eso Qdrant sigue "verde"). Compruébalo leyendo un vector:
-  si sale todo en 0.0, reindexa (el contrato aguantó: negó en vez de
-  inventar):
+  reiniciar Docker** → los vectores en disco se pusieron a cero. **Causa
+  confirmada y arreglada el 2026-10-11**: con `./qdrant_data:/qdrant/storage`
+  (bind mount de Windows) TODOS los vectores de TODAS las colecciones vuelven
+  a 0.0 tras un reinicio, con puntos y payloads intactos — por eso Qdrant sigue
+  "verde", la rama de texto sigue viva y nada avisa, pero el denso muere, el
+  suelo del pool deja el pool vacío y el sistema niega todo (mató así las
+  revisiones r8 y r10). El compose usa ahora un **volumen nombrado**, que
+  sobrevive al reinicio (probado A/B: mismo test con y sin bind mount). Si aun
+  así ves ceros, comprueba que el volumen está montado y reconstruye:
+  `.venv\Scripts\python.exe outputs\rag-probe\rebuild_vectors.py` (~11 min,
+  re-embebe los `child_text` ya almacenados y mueve los alias al publicar).
+  Compruébalo leyendo un vector:
   ```powershell
   .\.venv\Scripts\python -c "import sys; sys.path.insert(0,'src'); from qdrant_client import QdrantClient; c=QdrantClient(url='http://127.0.0.1:6333'); p,_=c.scroll('manual_rN_text', limit=1, with_vectors=True); print(sum(1 for x in (p[0].vector or []) if abs(x)>1e-9))"
   ```

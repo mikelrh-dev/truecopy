@@ -1,0 +1,63 @@
+{
+  "criteria": "Relevancia BINARIA y a nivel de PÁGINA, porque la página es la unidad del contrato de citación: una página recuperada es relevante si y solo si contiene la respuesta que un operario aceptaría para esa pregunta del manual cargado. Se escribe el número de página del PDF tal cual lo cita la cadena (no el número del índice del manual, no el folio impreso). Una pregunta cuya respuesta legítima sea 'el manual no lo cubre' es un CONTROL fuera de corpus: se marca expect_refusal=true, no lleva páginas y lo correcto es un pool vacío (nunca se puntúa como rango 0). Regla de desacuerdo: si dos anotadores no coinciden en una página, se etiqueta la UNIÓN y la discrepancia se anota en 'note' — el set mide recuperación, no la opinión de un anotador. Ningún caso se etiqueta por lo que el sistema devolvió; se etiqueta leyendo el manual.",
+  "status": "seeded",
+  "target_size": 25,
+  "notes": "Semilla con los casos YA verificados en vivo (los golden sets de scripts/eval.py: 2 del 828D y 7 del Tesla Model 3, incluido el control fuera de corpus). Los casos que faltan hasta target_size se añaden midiendo contra el corpus vivo (docker compose up -d) y etiquetando ANTES de leer la salida del sistema; no se rellenan a ojo offline, porque un juicio de relevancia inventado contamina la métrica en silencio.",
+  "cases": [
+    {
+      "manual_id": "828D_DA_1015_en_en_US",
+      "query": "10730",
+      "relevant_pages": [100],
+      "note": "Alarma del manual de fresado 828D (tabla de alarmas)."
+    },
+    {
+      "manual_id": "828D_DA_1015_en_en_US",
+      "query": "1192",
+      "relevant_pages": [348],
+      "note": "Alarma del manual de fresado 828D (tabla de alarmas)."
+    },
+    {
+      "manual_id": "Owners_Manual",
+      "query": "presion neumaticos",
+      "relevant_pages": [98, 99, 205, 206, 294],
+      "note": "Presión de neumáticos: varias páginas del manual del Model 3 la cubren, se etiqueta la unión."
+    },
+    {
+      "manual_id": "Owners_Manual",
+      "query": "que luces de testigo hay en el cuadro",
+      "relevant_pages": [15, 16],
+      "note": "Sección 'Indicator Lights'. Las expectativas previas (75/76/79/81) estaban mal registradas: 75 es 'High Beam Headlights'."
+    },
+    {
+      "manual_id": "Owners_Manual",
+      "query": "como uso autopilot?",
+      "relevant_pages": [115],
+      "note": "Sección de Autopilot del Model 3."
+    },
+    {
+      "manual_id": "Owners_Manual",
+      "query": "Como configuro el limite de velocidad",
+      "relevant_pages": [147],
+      "note": "'How Speed Assist Works' vive en la p.147 (medido 3/3 tras los arreglos de citación)."
+    },
+    {
+      "manual_id": "Owners_Manual",
+      "query": "¿Cómo se abrocha el cinturón de seguridad?",
+      "relevant_pages": [39, 40, 41, 44, 46],
+      "note": "La sección del cinturón abarca 39-46 y el reranker elige legítimamente cualquiera: la relevancia es la REGIÓN."
+    },
+    {
+      "manual_id": "Owners_Manual",
+      "query": "¿Cómo se remolca el Model 3?",
+      "relevant_pages": [241],
+      "note": "Sección de remolque."
+    },
+    {
+      "manual_id": "Owners_Manual",
+      "query": "¿quién es el presidente de francia?",
+      "relevant_pages": [],
+      "expect_refusal": true,
+      "note": "Control fuera de corpus: lo correcto es un pool vacío, no un rango."
+    }
+  ]
+}

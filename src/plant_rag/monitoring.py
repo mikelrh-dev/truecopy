@@ -17,10 +17,19 @@ Conventions established here:
   not operator traffic.
 * The same file doubles as the event store: votes are appended as
   ``{"event": "feedback"}`` lines and decline signals as
-  ``{"event": "decline-strong-pool"}`` lines under the SAME lock. A second
+  ``{"event": "decline-strong-pool"}`` lines under  the SAME lock. A second
   file would split one history in two, and every reader already tolerates
   the event schema (``records()`` branches on ANY event before any field
   access, so a future event type cannot be misread as a corrupt answer).
+* ``_FIELDS`` is the REQUIRED answer schema and ``_OPTIONAL_FIELDS`` the
+  additive one. The split is a compatibility rule, not a style choice:
+  ``records()`` projects each line onto the required fields, so promoting a
+  new field to ``_FIELDS`` would make every line written before it raise
+  ``KeyError`` and be swallowed as corrupt - the entire existing history
+  would vanish from the stats and the web metrics without one error.
+* Phase timings (``phases``) are the first optional field: seconds per phase
+  of the chain that ran, unrounded, omitted from the line entirely when
+  nothing was timed (a cache hit), so the record keeps its historical shape.
 """
 
 from __future__ import annotations
@@ -54,10 +63,21 @@ _FEEDBACK_FIELDS = (
     "model",
 )
 
+# Additive answer fields: merged into a record when the line carries them,
+# never required (see the module docstring for why that distinction is load
+# bearing). "phases" is M4's per-phase telemetry.
+_OPTIONAL_FIELDS = ("phases",)
+
 
 @dataclass(frozen=True)
 class QueryRecord:
-    """One answered operator question — the unit the log aggregates on."""
+    """One answered operator question — the unit the log aggregates on.
+
+    ``phases`` holds the seconds spent in each phase of the chain that ran
+    (``embed_s``, ``qdrant_s``, ``rerank_s``, ``llm_s``), unrounded so their
+    sum stays bounded by ``latency_s``. ``None`` means nothing was timed -
+    a cache hit runs no phase - and the field is then absent from the line.
+    """
 
     ts: float
     question: str
@@ -67,9 +87,15 @@ class QueryRecord:
     manual_id: str
     revision: str
     model: str
+    phases: dict[str, float] | None = None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False)
+        payload = asdict(self)
+        if payload.get("phases") is None:
+            # Historical shape: no key at all, not a null a reader must know
+            # about (monitoring spec: the required schema does not change).
+            payload.pop("phases", None)
+        return json.dumps(payload, ensure_ascii=False)
 
 
 @dataclass(frozen=True)
@@ -162,7 +188,11 @@ class QueryLog:
                             # (operator-feedback spec: "Feedback records
                             # MUST NOT count toward answer stats").
                             continue
-                        parsed.append(QueryRecord(**{k: data[k] for k in _FIELDS}))
+                        fields = {k: data[k] for k in _FIELDS}
+                        for optional in _OPTIONAL_FIELDS:
+                            if optional in data:
+                                fields[optional] = data[optional]
+                        parsed.append(QueryRecord(**fields))
                     except Exception:  # noqa: BLE001 - skip corrupt lines
                         continue
         except Exception:  # noqa: BLE001 - an unreadable log reads as empty
@@ -219,11 +249,43 @@ class QueryLog:
         except Exception:  # noqa: BLE001 - a failed signal never blocks
             pass
 
+    def record_citation_quality(
+        self, question: str, quality: dict, *, model: str
+    ) -> None:
+        """Append one citation-quality event; best-effort like every write.
+
+        ``quality`` is the ``to_dict()`` shape of a red-flagged
+        ``CitationReport`` (plus an optional ``reason``). The event is
+        MEASUREMENT ONLY: it never changes an answer and never feeds back
+        into serving. Readers use ``event_records("citation-quality")``.
+        Answer lines keep their schema — this is a separate event line, so
+        no historical line can break on read.
+        """
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock, self.path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "event": "citation-quality",
+                            "ts": time.time(),
+                            "question": question,
+                            "model": model,
+                            **quality,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        except Exception:  # noqa: BLE001 - a failed signal never blocks
+            pass
+
     def event_records(self, event: str | None = None) -> list[dict]:
         """Every parseable event line (votes, decline signals), raw dicts.
 
         ``event`` filters by type when given (``"feedback"``,
-        ``"decline-strong-pool"``). Answer lines and corruption are skipped.
+        ``"decline-strong-pool"``, ``"citation-quality"``). Answer lines
+        and corruption are skipped.
         """
         if not self.path.is_file():
             return []
@@ -284,6 +346,7 @@ def build_record(
     *,
     model: str,
     revision: str = "",
+    phases: dict[str, float] | None = None,
 ) -> QueryRecord:
     """The record for one answer: provenance from its citations, no content.
 
@@ -292,6 +355,10 @@ def build_record(
     historical shape; the answering chain always knows it and passes it, which
     is what lets the log answer "which corpus did this come from" after a
     reindex - the same provenance the calibration advisory warns about.
+
+    ``phases`` are the seconds per phase the chain actually timed, or ``None``
+    when nothing ran (cache hit). Passing it never changes the required
+    schema; omitting it writes the historical line byte for byte.
     """
     pages = tuple(
         dict.fromkeys(
@@ -309,6 +376,7 @@ def build_record(
         manual_id=manual_id,
         revision=revision,
         model=model,
+        phases=dict(phases) if phases else None,
     )
 
 

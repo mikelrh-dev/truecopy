@@ -141,7 +141,8 @@ tests/              suite hermética (sin Qdrant ni Ollama)
 ## Acceso LAN y regla de firewall (ADR-006)
 
 La app escucha en `0.0.0.0:8501` para llegar a la LAN; la regla de firewall
-es la frontera que la mantiene alcanzable solo desde la subred local:
+es la frontera que la mantiene alcanzable solo desde la subred local (port 8501
+open **only from the LAN subnet**):
 
 ```bash
 # Ejemplo iptables (subred del operador): aceptar la subred, tirar el resto.

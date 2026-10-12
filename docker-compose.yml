@@ -16,9 +16,24 @@ services:
       - "127.0.0.1:6334:6334" # gRPC
     volumes:
       # Collection data persists across restarts. Dense vectors are created
-      # with on_disk=True by retrieve/store.py (Phase 3); this mount keeps the
-      # storage on disk instead of inside the container's writable layer.
-      - ./qdrant_data:/qdrant/storage
+      # with on_disk=True by retrieve/store.py (Phase 3), so the storage has to
+      # live outside the container's writable layer.
+      #
+      # NAMED VOLUME - NOT a host bind mount. Measured 2026-10-11: with
+      # ``./qdrant_data:/qdrant/storage`` EVERY vector in every collection came
+      # back all-zero after ``docker compose stop && up``, while points and
+      # payloads survived. So counts stayed right, the text branch stayed
+      # alive, nothing logged an error and the container reported a clean
+      # "Recovered ... 100%" - but the dense branch was dead, the pool floor
+      # emptied the pool and every question got the exact refusal (it had
+      # already killed revisions r8 and r10 that way). The identical
+      # experiment on a named volume survives the restart with identical
+      # scores. Do NOT switch this back to a bind mount.
+      #
+      # Back it up with:
+      #   docker run --rm -v ragproyect_qdrant_data:/d -v "$PWD":/b \
+      #     alpine tar czf /b/qdrant-backup.tgz -C /d .
+      - qdrant_data:/qdrant/storage
     healthcheck:
       # The image ships no curl/wget: probe /readyz over raw bash /dev/tcp.
       test:
@@ -30,3 +45,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+
+volumes:
+  # Owned by Docker, not by the repo working tree: see the volumes comment in
+  # the service above for why this is not a bind mount any more.
+  qdrant_data:

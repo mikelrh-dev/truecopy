@@ -53,5 +53,9 @@ plant-rag-*.md
 MEJORAS-RAG.md
 scripts/wiki/
 
+# TeachMe learning artifacts (local-only study notes, like the wiki above)
+LEARNING_LOG.md
+visuals/
+
 # Local lockfile (project pins live in requirements.txt)
 uv.lock

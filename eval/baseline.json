@@ -1,0 +1,27 @@
+{
+  "metrics": {
+    "k": 5,
+    "queries": 7,
+    "scored": 6,
+    "hit_rate": 1.0,
+    "mrr": 0.625,
+    "precision": 0.3667,
+    "recall": 0.8667,
+    "refusal_ok": 1,
+    "refusal_total": 1,
+    "ranks": {
+      "presion neumaticos": 2,
+      "que luces de testigo hay en el cuadro": 1,
+      "como uso autopilot?": 2,
+      "Como configuro el limite de velocidad": 4,
+      "¿Cómo se abrocha el cinturón de seguridad?": 1,
+      "¿Cómo se remolca el Model 3?": 2
+    }
+  },
+  "checks": {
+    "alarm retrieval": true,
+    "cross-lingual ES->EN": true,
+    "refusal": true,
+    "golden grounding": true
+  }
+}

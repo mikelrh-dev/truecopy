@@ -74,6 +74,8 @@ SYSTEM_PROMPT_ES = (
     "NO la cites: cita únicamente la página del extracto usado.\n"
     "5. Si los extractos no cubren la pregunta, responde exactamente: "
     f"{REFUSAL_ES}\n"
+    "6. Si usas la misma página varias veces, cítala UNA sola vez (la "
+    "primera). Usa como máximo 5 páginas distintas por respuesta.\n"
     "Ejemplo: si un extracto viene etiquetado [Fuente: 828D Página 12] y "
     "dice \"Coolant pressure: 1.2 bar\", responde "
     "\"La presión del refrigerante es 1.2 bar [Fuente: 828D Página 12]\".\n"

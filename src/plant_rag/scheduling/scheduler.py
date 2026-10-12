@@ -18,7 +18,13 @@ Conventions established here:
   reports :class:`~plant_rag.answer.llm.DeadlineExceeded` — yields the same
   timeout answer). No partial or late answer is ever returned.
 * ``submit`` reports the caller's queue position (Spanish helper provided),
-  which is also the position quoted back in the timeout message.
+  which is also the position quoted back in the timeout message. That number
+  is a SNAPSHOT taken at submit - how far back the operator joined - and it is
+  deliberately NOT refreshed at dispatch: ``tests/test_scheduler.py`` pins it
+  (``test_timeout_reports_each_querys_submit_position``) and ``TIMEOUT_ES``
+  quotes it as part of the operator-facing contract. A queue that drained
+  afterwards therefore still reports the original position, which answers
+  "how long was I waiting behind", not "how deep is the queue now".
 * Thread safety: mutations are lock-guarded because the Streamlit web layer
   (Phase 6) submits from concurrent sessions while the worker dispatches;
   generation itself runs outside the lock so operators can keep joining the
@@ -115,6 +121,11 @@ class Scheduler:
 
     def submit(self, query: str) -> int:
         """Enqueue ``query`` and return its Spanish-reported queue position.
+
+        The position is the submit-time snapshot (waiting + in flight + this
+        one) and stays frozen for the life of the entry: it is what the
+        timeout message reports, by contract, even if the queue drains while
+        the entry waits. Never renumbered at dispatch.
 
         Raises:
             ValueError: if ``query`` is blank.

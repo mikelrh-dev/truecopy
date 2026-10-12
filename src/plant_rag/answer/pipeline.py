@@ -47,11 +47,17 @@ from qdrant_client import QdrantClient
 from plant_rag import config
 from plant_rag.answer.cache import AnswerCache
 from plant_rag.answer.llm import DeclineSignal, Transport, generate as llm_generate
+from plant_rag.eval_metrics import citation_report
 from plant_rag.models import REFUSAL_ES, Answer, Citation, Hit
 from plant_rag.monitoring import QueryLog, build_record
 from plant_rag.retrieve.embedder import get_embedder
 from plant_rag.retrieve.expand import expand_query, keyword_variant
-from plant_rag.retrieve.fastpath import AlarmHit, lookup, lookup_code
+from plant_rag.retrieve.fastpath import (
+    AlarmHit,
+    has_alarm_table,
+    lookup,
+    lookup_code,
+)
 from plant_rag.retrieve.hybrid import hybrid_search
 from plant_rag.retrieve.rerank import rerank
 from plant_rag.retrieve.store import current_revision
@@ -117,6 +123,20 @@ def _page_diverse(pool: list[Hit]) -> list[Hit]:
     return diverse
 
 
+def _add_phase(
+    timings: dict[str, float] | None, key: str, seconds: float
+) -> None:
+    """Accumulate one phase's seconds into ``timings`` (no-op when disabled).
+
+    Phases accumulate rather than overwrite because multi-query retrieval runs
+    embed/retrieval/rerank more than once per answer: the record wants the time
+    the PHASE cost, not the time of its last call.
+    """
+    if timings is None:
+        return
+    timings[key] = timings.get(key, 0.0) + seconds
+
+
 def retrieve_pool(
     client: QdrantClient, question: str, query_vector: list[float]
 ) -> tuple[Hit, ...]:
@@ -134,7 +154,12 @@ def retrieve_pool(
     return tuple(_page_diverse(_mentioned_alarm_rows(client, question) + list(pool)))
 
 
-def retrieve_and_rank(client: QdrantClient, question: str) -> tuple[Hit, ...]:
+def retrieve_and_rank(
+    client: QdrantClient,
+    question: str,
+    *,
+    timings: dict[str, float] | None = None,
+) -> tuple[Hit, ...]:
     """The ranked candidates an answer may cite, built by backfill (not union).
 
     Multi-query retrieval with BACKFILL semantics: the question's own pool is
@@ -147,10 +172,23 @@ def retrieve_and_rank(client: QdrantClient, question: str) -> tuple[Hit, ...]:
 
     Public because the scripted eval validates citations against exactly
     this function - the grounding an operator-visible answer depends on.
+
+    ``timings`` (optional) receives the seconds spent in ``embed_s``,
+    ``qdrant_s`` and ``rerank_s``; it is filled in place and never changes
+    what is retrieved (M4). ``None`` measures nothing.
     """
     expanded = expand_query(question)
+    started = time.monotonic()
     query_vector = get_embedder().encode([expanded])[0]
-    hits = rerank(question, retrieve_pool(client, expanded, query_vector), top_k=config.TOP_K)
+    _add_phase(timings, "embed_s", time.monotonic() - started)
+
+    started = time.monotonic()
+    pool = retrieve_pool(client, expanded, query_vector)
+    _add_phase(timings, "qdrant_s", time.monotonic() - started)
+
+    started = time.monotonic()
+    hits = rerank(question, pool, top_k=config.TOP_K)
+    _add_phase(timings, "rerank_s", time.monotonic() - started)
 
     variant = keyword_variant(question)
     if variant is None or len(hits) >= config.TOP_K:
@@ -158,15 +196,23 @@ def retrieve_and_rank(client: QdrantClient, question: str) -> tuple[Hit, ...]:
 
     taken = {(hit.manual_id, hit.page) for hit in hits}
     variant_expanded = expand_query(variant)
+    started = time.monotonic()
     variant_vector = get_embedder().encode([variant_expanded])[0]
+    _add_phase(timings, "embed_s", time.monotonic() - started)
+
+    started = time.monotonic()
     extra = [
         hit
         for hit in retrieve_pool(client, variant_expanded, variant_vector)
         if (hit.manual_id, hit.page) not in taken
     ]
+    _add_phase(timings, "qdrant_s", time.monotonic() - started)
+
+    started = time.monotonic()
     backfill = rerank(
         question, tuple(extra), top_k=config.TOP_K - len(hits)
     )
+    _add_phase(timings, "rerank_s", time.monotonic() - started)
     return hits + backfill
 
 
@@ -249,6 +295,9 @@ def answer_question(
             qdrant = QdrantClient(url=config.QDRANT_URL, timeout=10)
         revision = current_revision(qdrant)
 
+    # Phase timings are only collected when a record will consume them: the
+    # eval passes no log and pays nothing at all (M4).
+    phases: dict[str, float] | None = {} if log is not None else None
     answer = _answer_question(
         question,
         remaining_s,
@@ -261,7 +310,28 @@ def answer_question(
                 q, hits, model=config.OLLAMA_MODEL
             )
         ),
+        timings=phases,
     )
+    if log is not None and answer.kind == "answer":
+        # Citation-quality hook (measurement only, Prop #1): a red-flagged
+        # pattern is recorded as a separate "citation-quality" event; the
+        # answer is never modified and the hook can never break answering.
+        # Eval traffic passes no log and pays nothing. Cached hits skip
+        # this (the answer was measured when first served).
+        try:
+            quality = citation_report(
+                question, answer.text_es, kind="answer",
+                citations=answer.citations,
+            )
+        except Exception:  # noqa: BLE001 - measurement never breaks serving
+            quality = None
+        if quality is not None and quality.red_flag:
+            try:
+                log.record_citation_quality(
+                    question, quality.to_dict(), model=config.OLLAMA_MODEL
+                )
+            except Exception:  # noqa: BLE001 - a failed write never blocks
+                pass
     if cache is not None:
         # Store only if the corpus did not move under the chain's feet
         # (the re-check runs on the miss path only). A store failure must
@@ -280,6 +350,7 @@ def answer_question(
                 time.monotonic() - started,
                 model=config.OLLAMA_MODEL,
                 revision=_revision_tag(revision),
+                phases=phases,
             )
         )
     return answer
@@ -297,6 +368,7 @@ def _answer_question(
     client: QdrantClient | None,
     transport: Transport | None,
     decline_signal: DeclineSignal | None = None,
+    timings: dict[str, float] | None = None,
 ) -> Answer:
     # The blank-question gate lives in ``answer_question`` (before any cache
     # lookup); this private chain assumes a non-blank question.
@@ -305,24 +377,41 @@ def _answer_question(
     )
 
     # Gate 1: exact code-shaped question (ADR-003), before any embedding.
+    # Timed as ``qdrant_s``: resolving the alias and scrolling the alarm rows
+    # IS the whole cost of this path, and the path that pays it deserves the
+    # same telemetry as the semantic one (a non-code-shaped question costs
+    # nothing here: the shape gate short-circuits before any store call).
+    started = time.monotonic()
     exact = lookup(qdrant, question)
+    # A code-shaped question that resolved to nothing may only be refused where
+    # an alarm table EXISTS to have missed it (E3). The probe is short-circuited
+    # onto that one branch, so no other query shape pays for it.
+    has_table = exact == () and has_alarm_table(qdrant)
+    _add_phase(timings, "qdrant_s", time.monotonic() - started)
+
     if exact is None:
         pass  # not code-shaped: semantic path below
-    elif not exact:
-        return refusal()  # unknown code: exact refusal, no semantic fallback
-    else:
+    elif exact:
         return alarm_answer(exact)
+    elif has_table:
+        return refusal()  # unknown code on a corpus WITH a table: ADR-003
+    # else: this corpus has no alarm table, so 4-6 bare digits are prose (a
+    # year, a page, a line of a listing). Refusing them by SHAPE would be a
+    # recall failure, not contract discipline: fall through to Gate 2.
 
     # Gate 2: evidence. The retrieval text expands the question with the
     # English terms the manual would use (ES->EN glossary): the operator
     # writes "presión neumáticos", the manual says "Tire Pressure". The
     # reranker and the LLM still see the ORIGINAL question below - expansion
     # is a retrieval aid, never a rewrite of what was asked.
-    hits = retrieve_and_rank(qdrant, question)
+    hits = retrieve_and_rank(qdrant, question, timings=timings)
 
     options: dict = {"remaining_s": remaining_s}
     if transport is not None:
         options["transport"] = transport
     if decline_signal is not None:
         options["decline_signal"] = decline_signal
-    return llm_generate(question, hits, **options)
+    started = time.monotonic()
+    answer = llm_generate(question, hits, **options)
+    _add_phase(timings, "llm_s", time.monotonic() - started)
+    return answer

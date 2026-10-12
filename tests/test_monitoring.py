@@ -35,6 +35,64 @@ def test_record_round_trips_through_one_jsonl_line(tmp_path) -> None:
     assert "answer" not in {k: v for k, v in data.items() if k != "kind"}.get("text", "")
 
 
+def test_phase_timings_round_trip_through_the_log(tmp_path) -> None:
+    # M4: additive phase timings, unrounded, next to the rounded total.
+    log = QueryLog(tmp_path / "queries.jsonl")
+    phases = {"embed_s": 0.0123, "qdrant_s": 0.0456, "rerank_s": 0.789, "llm_s": 4.5}
+
+    log.record(
+        build_record(
+            "presion neumaticos",
+            _answer("answer", (("M", 1),)),
+            5.4,
+            model="m",
+            phases=phases,
+        )
+    )
+
+    line = (tmp_path / "queries.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    assert json.loads(line)["phases"] == phases
+    records = log.records()
+    assert records[0].phases == phases
+    assert sum(records[0].phases.values()) <= 5.4  # never more than the total
+
+
+def test_a_record_without_timings_keeps_its_historical_shape(tmp_path) -> None:
+    # The key must be ABSENT (not null): a reader that predates the field sees
+    # exactly the line it has always seen.
+    log = QueryLog(tmp_path / "queries.jsonl")
+
+    log.record(build_record("q", _answer("refusal"), 0.2, model="m"))
+
+    line = (tmp_path / "queries.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    assert "phases" not in json.loads(line)
+    assert log.records()[0].phases is None
+
+
+def test_a_line_written_before_phase_timings_still_parses(tmp_path) -> None:
+    # The exact trap: the reader projects the line onto the required schema, so
+    # making the new field required would silently drop the whole history.
+    path = tmp_path / "queries.jsonl"
+    legacy = {
+        "ts": 1.0,
+        "question": "pregunta antigua",
+        "kind": "answer",
+        "latency_s": 2.5,
+        "pages": [7],
+        "manual_id": "Owners_Manual",
+        "revision": "r3",
+        "model": "m",
+    }
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    records = QueryLog(path).records()
+
+    assert len(records) == 1
+    assert records[0].question == "pregunta antigua"
+    assert records[0].phases is None
+    assert stats(records)["total"] == 1  # history still counts
+
+
 def test_reading_back_a_corrupt_line_skips_it_instead_of_failing(tmp_path) -> None:
     path = tmp_path / "queries.jsonl"
     log = QueryLog(path)
@@ -324,3 +382,38 @@ def test_decline_signal_write_failure_never_raises(tmp_path) -> None:
     log = QueryLog(blocker / "nested" / "queries.jsonl")
 
     log.record_decline_signal("q", _decline_hits(), model="m")  # no raise
+
+
+# ---------------------------------------------------------------------------
+# citation-quality events (Prop #1: measurement only, separate event line)
+# ---------------------------------------------------------------------------
+
+
+def test_citation_quality_round_trips_as_its_own_event(tmp_path) -> None:
+    path = tmp_path / "queries.jsonl"
+    log = QueryLog(path)
+    log.record_citation_quality(
+        "que es el tia",
+        {"red_flag": True, "total_citations": 14, "unique_pages": 1},
+        model="m",
+    )
+
+    events = log.event_records("citation-quality")
+    assert len(events) == 1
+    assert events[0]["question"] == "que es el tia"
+    assert events[0]["red_flag"] is True
+    assert events[0]["total_citations"] == 14
+    assert events[0]["model"] == "m"
+
+    # Separate schema, zero bleed: answers and other events are untouched.
+    assert log.records() == []
+    assert log.event_records("decline-strong-pool") == []
+
+
+def test_citation_quality_write_failure_never_raises(tmp_path) -> None:
+    # Measurement must never block or break an answer: same best-effort rule.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    log = QueryLog(blocker / "nested" / "queries.jsonl")
+
+    log.record_citation_quality("q", {"red_flag": True}, model="m")  # no raise

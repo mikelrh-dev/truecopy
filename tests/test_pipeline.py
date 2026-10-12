@@ -321,6 +321,55 @@ def test_repeat_question_hits_the_cache_logged_as_near_zero_latency(
     assert records[1].latency_s < 0.1  # the hit's REAL near-zero latency
 
 
+# ---------------------------------------------------------------------------
+# phase telemetry (M4)
+# ---------------------------------------------------------------------------
+
+
+def test_a_semantic_answer_records_every_phase_it_ran(monkeypatch, tmp_path) -> None:
+    _stub_full_pool(monkeypatch, (10, 15, 123, 141, 187))
+    monkeypatch.setattr(pipeline, "current_revision", lambda client: 3)
+    log = QueryLog(tmp_path / "queries.jsonl")
+
+    pipeline.answer_question(
+        "como configuro el limite de velocidad",
+        30.0,
+        client=_NoopClient(),
+        transport=_DeclineTransport(),
+        log=log,
+    )
+
+    record = log.records()[0]
+    assert record.phases is not None
+    # The four phases of a semantic answer, by their spec names.
+    assert set(record.phases) == {"embed_s", "qdrant_s", "rerank_s", "llm_s"}
+    assert all(value >= 0 for value in record.phases.values())
+    # Phases are disjoint slices of the timed interval: their sum can only
+    # exceed the total by the total's own three-decimal rounding.
+    assert sum(record.phases.values()) <= record.latency_s + 0.001
+
+
+def test_a_cache_hit_records_no_phases_while_the_miss_records_them(
+    monkeypatch, tmp_path
+) -> None:
+    # Nothing runs on a hit, so there is nothing to time: the line keeps its
+    # historical shape instead of claiming 0.0s phases that never happened.
+    _stub_empty_chain(monkeypatch)
+    monkeypatch.setattr(pipeline, "current_revision", lambda client: 7)
+    cache = AnswerCache(tmp_path / "cache.jsonl")
+    log = QueryLog(tmp_path / "queries.jsonl")
+
+    pipeline.answer_question(_QUESTION, 30.0, client=_NoopClient(), log=log, cache=cache)
+    _forbid_chain(monkeypatch)
+    pipeline.answer_question(
+        "que es el tia", 30.0, client=_NoopClient(), log=log, cache=cache
+    )
+
+    miss, hit = log.records()
+    assert miss.phases is not None and all(v >= 0 for v in miss.phases.values())
+    assert hit.phases is None
+
+
 def test_a_revision_or_model_change_misses_and_reruns_the_chain(
     monkeypatch, tmp_path
 ) -> None:
@@ -442,3 +491,89 @@ def test_a_blank_question_raises_before_any_cache_lookup(tmp_path) -> None:
         pipeline.answer_question("   ", 30.0, client=_NoopClient(), cache=cache)
 
     assert not (tmp_path / "cache.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
+# citation-quality hook (Prop #1: measurement only, never modifies answers)
+# ---------------------------------------------------------------------------
+
+
+def _over_cited_answer():
+    """The live Q5 pattern: 14 citations, all page 15, short text."""
+    from plant_rag.models import Answer, Citation
+
+    return Answer(
+        kind="answer",
+        text_es="Es el indicador [Fuente: Owners_Manual Página 15]. " * 3,
+        citations=tuple(
+            Citation(manual_id="Owners_Manual", page=15) for _ in range(14)
+        ),
+    )
+
+
+def _clean_answer():
+    from plant_rag.models import Answer, Citation
+
+    return Answer(
+        kind="answer",
+        text_es=(
+            "La presión del refrigerante es 1.2 bar "
+            "[Fuente: Owners_Manual Página 12] y el par de apriete es 8 Nm "
+            "[Fuente: Owners_Manual Página 13]."
+        ),
+        citations=(
+            Citation(manual_id="Owners_Manual", page=12),
+            Citation(manual_id="Owners_Manual", page=13),
+        ),
+    )
+
+
+def _stub_answer_chain(monkeypatch, answer) -> None:
+    """Semantic path with a canned LLM answer; retrieval is irrelevant."""
+    monkeypatch.setattr(pipeline, "lookup", lambda client, question: None)
+    monkeypatch.setattr(
+        pipeline, "retrieve_and_rank", lambda client, question, timings=None: ()
+    )
+    monkeypatch.setattr(pipeline, "llm_generate", lambda *a, **k: answer)
+    monkeypatch.setattr(pipeline, "current_revision", lambda client: 3)
+
+
+def test_an_over_cited_answer_records_one_quality_event(
+    monkeypatch, tmp_path
+) -> None:
+    """Measurement only: the answer is untouched; the event carries metrics."""
+    _stub_answer_chain(monkeypatch, _over_cited_answer())
+    log = QueryLog(tmp_path / "queries.jsonl")
+
+    answer = pipeline.answer_question(
+        "que es el tia", 30.0, client=_NoopClient(), log=log
+    )
+
+    assert answer.kind == "answer"
+    assert len(answer.citations) == 14  # nothing was cut or rewritten
+    events = log.event_records("citation-quality")
+    assert len(events) == 1
+    assert events[0]["red_flag"] is True
+    assert events[0]["total_citations"] == 14
+
+
+def test_a_clean_answer_records_no_quality_event(monkeypatch, tmp_path) -> None:
+    _stub_answer_chain(monkeypatch, _clean_answer())
+    log = QueryLog(tmp_path / "queries.jsonl")
+
+    answer = pipeline.answer_question(
+        "presion refrigerante", 30.0, client=_NoopClient(), log=log
+    )
+
+    assert answer.kind == "answer"
+    assert log.event_records("citation-quality") == []
+
+
+def test_traffic_without_a_log_pays_no_measurement(monkeypatch, tmp_path) -> None:
+    """Eval traffic passes no log: the hook costs nothing and writes nothing."""
+    _stub_answer_chain(monkeypatch, _over_cited_answer())
+
+    answer = pipeline.answer_question("que es el tia", 30.0, client=_NoopClient())
+
+    assert answer.kind == "answer"
+    assert not (tmp_path / "queries.jsonl").exists()

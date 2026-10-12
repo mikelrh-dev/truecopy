@@ -51,6 +51,7 @@ Caveats:
 from __future__ import annotations
 
 import argparse
+import re
 import time
 import sys
 from dataclasses import dataclass
@@ -379,6 +380,56 @@ def check_alarm_known_and_unknown(
     )
 
 
+# A shared sentence this long is boilerplate a manual repeats across sibling
+# pages ("Try charging the vehicle with different charging equipment..."), not
+# a coincidence. Shorter fragments ("See page 12.") are ignored on purpose:
+# matching those would make ANY two pages of one manual look equivalent.
+_MIN_SHARED_SENTENCE = 40
+
+
+def _significant_lines(text: str) -> set[str]:
+    """Distinctive normalized sentences of one page's text.
+
+    Whitespace-collapsed and lowercased, so a re-extraction that only moved
+    line breaks still matches. When a page has no long sentence at all, its
+    whole normalized text is used as the single comparable line instead of
+    returning nothing - a page with no comparable text must not silently
+    match every other page.
+    """
+    lines = {
+        " ".join(part.lower().split())
+        for part in re.split(r"(?<=[.!?])\s+|\n+", text or "")
+    }
+    significant = {line for line in lines if len(line) >= _MIN_SHARED_SENTENCE}
+    if significant:
+        return significant
+    whole = " ".join((text or "").lower().split())
+    return {whole} if len(whole) >= _MIN_SHARED_SENTENCE else set()
+
+
+def _shares_evidence(sample_text: str, hits) -> bool:
+    """Whether a retrieved page carries the text the sample was taken from.
+
+    Manuals repeat boilerplate across sibling pages, so the page answering a
+    question is legitimately often NOT the page the sample came from: on the
+    Tesla manual, pages 277 and 279 both carry "Try charging the vehicle with
+    different charging equipment...", and retrieval returns 277. Demanding one
+    exact page number would measure sample luck instead of cross-linguality -
+    which is precisely what this check's own comment promises not to do, and
+    what the golden sets already model by labeling page REGIONS.
+
+    So the evidence test is content, not identity: the sampled page is covered
+    when a retrieved page shares a distinctive sentence with it.
+    """
+    sample_lines = _significant_lines(sample_text)
+    if not sample_lines:
+        return False  # nothing comparable: never claim a match on a blank
+    return any(
+        sample_lines & _significant_lines(getattr(hit, "parent", ""))
+        for hit in hits
+    )
+
+
 def check_crosslingual_es_en(client: QdrantClient) -> EvalResult:
     """Spanish question retrieves English passages and yields a cited answer."""
     t0 = _now_s()
@@ -447,11 +498,13 @@ def check_crosslingual_es_en(client: QdrantClient) -> EvalResult:
             detail=f"Spanish question did not retrieve any passage (top-k={config.TOP_K}, min_score={config.MIN_SCORE})",
         )
 
-    # The Spanish question SHOULD retrieve the page that contains the English
-    # text we sampled (or another page of the same manual — the point is that
-    # cross-lingual retrieval happened, not that a specific page was hit).
+    # The Spanish question SHOULD retrieve the English text we sampled — from
+    # the sampled page OR from a sibling page carrying the same text (the point
+    # is that cross-lingual retrieval happened, not which page number won the
+    # near-tie between duplicated pages). See :func:`_shares_evidence`.
     retrieved_pages = {h.page for h in hits}
-    crosslingual_evidence = sample_page in retrieved_pages
+    same_page = sample_page in retrieved_pages
+    crosslingual_evidence = same_page or _shares_evidence(sample_text, hits)
 
     # Now go through the answering contract: build the answer via the same
     # generate() path and verify it is grounded with at least one citation.
@@ -474,11 +527,17 @@ def check_crosslingual_es_en(client: QdrantClient) -> EvalResult:
 
     if not crosslingual_evidence:
         detail_parts.append(
-            f"Spanish question did not retrieve page {sample_page} (English source)"
+            f"Spanish question did not retrieve page {sample_page} nor any "
+            "sibling page carrying its English text"
         )
         passed = False
-    else:
+    elif same_page:
         detail_parts.append(f"Spanish question retrieved English page {sample_page}")
+    else:
+        detail_parts.append(
+            f"Spanish question retrieved a sibling page carrying the English "
+            f"text of page {sample_page}"
+        )
 
     if not citations_ok:
         detail_parts.append(f"answer was {answer.kind}, expected answer with citations")

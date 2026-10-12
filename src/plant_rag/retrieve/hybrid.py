@@ -2,11 +2,15 @@
 
 Conventions established here:
 
-* ONE ``query_points`` call with two prefetches and ``Fusion.RRF`` fusion, so
-  the fused ranking happens inside Qdrant (no client-side merge, no second
-  network round-trip): the dense branch keeps the calibrated relevance floor
+* TWO ``query_points`` calls per search, in this order: (1) a ``limit=1``
+  pool-level dense probe with the calibrated floor, and (2) ONE fused call with
+  two prefetches and ``Fusion.RRF``, so the fused RANKING happens inside Qdrant
+  (no client-side merge). The dense branch keeps the calibrated relevance floor
   and the text branch gates tokens, so both precision mechanisms of the dense
-  path survive the fusion unchanged.
+  path survive the fusion unchanged. The probe is what makes the floor a
+  POOL-level rule (see the floor bullet) and it is deliberately a separate
+  call: a fused response carries RRF-fused scores, so a caller cannot ask it
+  whether any dense candidate cleared the floor.
 * Revision scoping mirrors ``store.search`` exactly: resolve ``current_text``,
   take the revision tag from the physical collection, and filter BOTH
   prefetches on it. An alias outside the ``manual_r{N}_text`` contract returns
